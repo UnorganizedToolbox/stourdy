@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, Flame, Coffee, Moon } from "lucide-react";
 import { countCompletedWorkByStudent } from "@/lib/pomodoroAnalyticsLoader";
+import RealtimePageRefresh from "../components/RealtimePageRefresh";
 
 const RUNNING_EVENTS = new Set(['START', 'CHECK_REMAINING_TIME']);
 
@@ -73,6 +74,8 @@ export default async function TeacherPomodoroPage() {
         </div>
       </div>
 
+      {/* 生徒がタイマーを操作するたびに状態(集中中・休憩中)と今日の回数を更新する */}
+      <RealtimePageRefresh channel="org_pomodoro_events" table="pomodoro_events" />
       <div className="card-glass bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
         {students && students.length > 0 ? (
           <div className="divide-y divide-slate-100 dark:divide-slate-800">

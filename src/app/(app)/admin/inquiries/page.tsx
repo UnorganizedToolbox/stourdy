@@ -5,6 +5,7 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import InquiryForm from "../components/InquiryForm";
 import InquiryList from "../components/InquiryList";
+import RealtimePageRefresh from "../components/RealtimePageRefresh";
 
 export default async function InquiriesPage() {
   const supabase = await createClient();
@@ -40,6 +41,7 @@ export default async function InquiriesPage() {
 
       {!isAdmin && <InquiryForm />}
 
+      <RealtimePageRefresh channel="teacher_inquiries" table="teacher_inquiries" />
       <InquiryList inquiries={inquiries} isAdmin={isAdmin} />
     </section>
   );
