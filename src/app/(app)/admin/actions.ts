@@ -3,6 +3,7 @@
 import { createClient } from "@/utils/supabase/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { revalidatePath } from "next/cache";
+import { signQaImages } from "@/lib/qaImages";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { RULE_DEFS, type RuleMap, type OrgRuleMap, isValidThemeValue } from "@/lib/rules";
 
@@ -213,6 +214,23 @@ export async function setStudentNickname(studentId: string, name: string, locked
   revalidatePath(`/admin/student/${studentId}`);
 }
 
+// 質問箱の取得。/admin の質問欄(AdminQAPanel)が、ページ全体ではなく自分の分だけを取り直すのに使う。
+// 見える範囲は RLS で決まる(管理者は全件、教師は自団体の生徒の質問)。
+// 回答・返信(addAdminReply・answerQuestion)は revalidatePath を呼ばず、質問欄が自分で取り直す。
+export async function getAdminQuestions() {
+  const { supabase } = await verifyAdminOrTeacher();
+  const { data, error } = await supabase
+    .from('questions')
+    .select(`
+      *,
+      profiles:student_uuid (name, student_id)
+    `)
+    .order('created_at', { ascending: false })
+    .limit(300);
+  if (error) throw new Error('質問の取得に失敗しました');
+  return signQaImages(data ?? []);
+}
+
 export async function addAdminReply(formData: FormData) {
   const questionId = formData.get('question_id') as string;
   const text = (formData.get('text') as string) || '';
@@ -265,9 +283,6 @@ export async function addAdminReply(formData: FormData) {
     console.error('Failed to add admin reply', error);
     throw new Error('返信の送信に失敗しました');
   }
-
-  revalidatePath('/admin');
-  revalidatePath('/timer');
 }
 
 export async function answerQuestion(formData: FormData) {
@@ -288,10 +303,6 @@ export async function answerQuestion(formData: FormData) {
     console.error('Failed to answer question', error);
     throw new Error('回答の送信に失敗しました');
   }
-
-  revalidatePath('/admin');
-  revalidatePath('/timer');
-  return;
 }
 
 function sanitizeRuleMap(input: unknown): RuleMap {

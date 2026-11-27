@@ -1,7 +1,6 @@
 'use client'
 
 import { useRef, useState, useTransition } from 'react';
-import { useRouter } from 'next/navigation';
 import 'katex/dist/katex.min.css';
 import { InlineMath, BlockMath } from 'react-katex';
 import { replyToQuestion, resolveQuestion, toggleQuestionFavorite } from '../actions';
@@ -17,7 +16,7 @@ type Reply = {
   created_at: string;
 };
 
-type Question = {
+export type Question = {
   id: string;
   title: string;
   body: string;
@@ -29,8 +28,9 @@ type Question = {
   is_favorited?: boolean;
 };
 
-export default function QAThreadList({ initialQuestions }: { initialQuestions: Question[] }) {
-  const [questions, setQuestions] = useState(initialQuestions);
+// 一覧は親(StudentQAPanel)が持つ。操作のあとは onChanged で親に取り直してもらう
+// (router.refresh() はページ全体を取り直し、ポモドーロタイマーを巻き込むので使わない)。
+export default function QAThreadList({ questions, onChanged }: { questions: Question[]; onChanged: () => Promise<void> }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
   const [replyImage, setReplyImage] = useState<File | null>(null);
@@ -38,7 +38,6 @@ export default function QAThreadList({ initialQuestions }: { initialQuestions: Q
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const router = useRouter();
 
   const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -58,8 +57,7 @@ export default function QAThreadList({ initialQuestions }: { initialQuestions: Q
     startTransition(async () => {
       try {
         await resolveQuestion(id);
-        setQuestions(prev => prev.map(q => q.id === id ? { ...q, status: 'resolved' } : q));
-        router.refresh();
+        await onChanged();
       } catch (err) {
         setError(err instanceof Error ? err.message : '更新に失敗しました');
       }
@@ -71,8 +69,8 @@ export default function QAThreadList({ initialQuestions }: { initialQuestions: Q
     setError(null);
     startTransition(async () => {
       try {
-        const next = await toggleQuestionFavorite(id);
-        setQuestions(prev => prev.map(q => q.id === id ? { ...q, is_favorited: next } : q));
+        await toggleQuestionFavorite(id);
+        await onChanged();
       } catch (err) {
         setError(err instanceof Error ? err.message : '更新に失敗しました');
       }
@@ -93,7 +91,7 @@ export default function QAThreadList({ initialQuestions }: { initialQuestions: Q
         setReplyText('');
         setReplyImage(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
-        router.refresh();
+        await onChanged();
       } catch (err) {
         setError(err instanceof Error ? err.message : '返信の送信に失敗しました');
       }

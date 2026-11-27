@@ -4,7 +4,7 @@ import { useRef, useState, useTransition } from 'react';
 import { askQuestion } from '../actions';
 import { processQaImage } from '@/lib/imageProcessing';
 
-export default function AskQuestionForm() {
+export default function AskQuestionForm({ onAsked }: { onAsked: () => Promise<void> }) {
   const formRef = useRef<HTMLFormElement>(null);
   const [isPending, startTransition] = useTransition();
   const [isProcessingImage, setIsProcessingImage] = useState(false);
@@ -33,6 +33,7 @@ export default function AskQuestionForm() {
         await askQuestion(formData);
         formRef.current?.reset();
         setImageFile(null);
+        await onAsked();
       } catch (e) {
         setError(e instanceof Error ? e.message : '質問の送信に失敗しました');
       }

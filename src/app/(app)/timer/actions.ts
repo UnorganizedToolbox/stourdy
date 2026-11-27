@@ -7,7 +7,7 @@ import { evaluateAchievements } from "@/lib/gamification/engine";
 import { resolveEffectiveRules, type RuleMap, type OrgRuleMap } from "@/lib/rules";
 import { FAVORITE_QUESTION_LIMIT, RESOLVED_QUESTION_RETENTION_LIMIT, RESOLVED_QUESTION_RETENTION_DAYS } from "@/lib/qaLimits";
 import { countCompletedWork } from "@/lib/pomodoroAnalyticsLoader";
-import { qaImagePath } from "@/lib/qaImages";
+import { qaImagePath, signQaImages } from "@/lib/qaImages";
 
 
 // 解決済みかつお気に入りでない質問のうち、(a) 保持件数の上限を超えた分、または
@@ -59,6 +59,22 @@ async function cleanupOldResolvedQuestions(studentId: string) {
 
   const { error: deleteError } = await adminClient.from('questions').delete().in('id', toDelete.map(q => q.id));
   if (deleteError) console.error('Failed to delete old resolved questions', deleteError);
+}
+
+// 質問箱の Q&A 操作は revalidatePath('/timer') を呼ばない。呼ぶとページ全体が取り直され、同じページの
+// ポモドーロタイマーを巻き込む。質問欄は StudentQAPanel が getMyQuestions で自分の分だけ取り直す。
+export async function getMyQuestions() {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('ログインしていません');
+
+  const { data, error } = await supabase
+    .from('questions')
+    .select('*')
+    .eq('student_uuid', user.id)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error('質問の取得に失敗しました');
+  return signQaImages(data ?? []);
 }
 
 export async function askQuestion(formData: FormData) {
@@ -146,7 +162,6 @@ export async function askQuestion(formData: FormData) {
     }
 
     await cleanupOldResolvedQuestions(user.id);
-    revalidatePath('/timer');
     return;
   }
 
@@ -164,7 +179,6 @@ export async function askQuestion(formData: FormData) {
   }
 
   await cleanupOldResolvedQuestions(user.id);
-  revalidatePath('/timer');
   return;
 }
 
@@ -234,7 +248,6 @@ export async function replyToQuestion(formData: FormData) {
     throw new Error('返信の送信に失敗しました');
   }
 
-  revalidatePath('/timer');
 }
 
 export async function resolveQuestion(questionId: string) {
@@ -251,7 +264,6 @@ export async function resolveQuestion(questionId: string) {
 
   await cleanupOldResolvedQuestions(user.id);
 
-  revalidatePath('/timer');
 }
 
 // お気に入りの切り替え。お気に入りにした質問は自動削除の対象から外れる。
@@ -285,7 +297,6 @@ export async function toggleQuestionFavorite(questionId: string) {
     throw new Error('お気に入りの更新に失敗しました');
   }
 
-  revalidatePath('/timer');
   return nextValue;
 }
 

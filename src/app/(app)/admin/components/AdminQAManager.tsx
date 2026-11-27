@@ -13,7 +13,7 @@ type Reply = {
   created_at: string;
 };
 
-type Question = {
+export type Question = {
   id: string;
   title: string;
   body: string;
@@ -44,7 +44,7 @@ const STATUS_STYLE: Record<Question['status'], { label: string; badge: string }>
   resolved: { label: '解決済み', badge: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400' },
 };
 
-export default function AdminQAManager({ questions }: { questions: Question[] }) {
+export default function AdminQAManager({ questions, onChanged }: { questions: Question[]; onChanged: () => Promise<void> }) {
   const [tab, setTab] = useState<FilterTab>('open');
   const [query, setQuery] = useState('');
   const [answeringId, setAnsweringId] = useState<string | null>(null);
@@ -79,6 +79,7 @@ export default function AdminQAManager({ questions }: { questions: Question[] })
         await answerQuestion(formData);
         setAnsweringId(null);
         setAnswerText('');
+        await onChanged();
       } catch (e) {
         alert(e instanceof Error ? e.message : '回答の送信に失敗しました');
       }
@@ -99,6 +100,7 @@ export default function AdminQAManager({ questions }: { questions: Question[] })
         setReplyImage(null);
         if (replyFileInputRef.current) replyFileInputRef.current.value = '';
         setReplyingId(null);
+        await onChanged();
       } catch (e) {
         alert(e instanceof Error ? e.message : '返信の送信に失敗しました');
       }
