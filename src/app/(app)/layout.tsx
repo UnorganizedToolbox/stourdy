@@ -1,0 +1,90 @@
+import { cn } from "@/lib/utils";
+import { createClient } from "@/utils/supabase/server";
+import { redirect } from "next/navigation";
+import { calc_Lv_from_EXP } from '@/lib/gamification/level';
+import { resolveEffectiveRules, resolveEffectivePinnedTheme, type RuleMap, type OrgRuleMap } from '@/lib/rules';
+import HeaderDropdown from "./components/HeaderDropdown";
+import ThemeEnforcer from "./components/ThemeEnforcer";
+import { MobileNavProvider } from "./components/MobileNavContext";
+import { NavLockProvider } from "./components/NavLockContext";
+import MobileMenuButton from "./components/MobileMenuButton";
+import MobileSidebarDrawer from "./components/MobileSidebarDrawer";
+import SiteFooter from "@/components/SiteFooter";
+
+export default async function AppLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) {
+    redirect('/login');
+  }
+
+  // プロフィールと所属団体のルールを1回の問い合わせで取得する
+  // (以前はprofiles→organizationsと直列に2回問い合わせており、
+  // 毎回のタブ遷移のたびにこのlayout.tsxが再実行されるため、その分の
+  // 往復レイテンシがすべてのページ遷移に積み重なっていた)
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('*, organizations:organization_id (rules)')
+    .eq('id', user.id)
+    .single();
+
+  if (profile?.status === 'pending') {
+    await supabase.auth.signOut();
+    redirect('/login?error=' + encodeURIComponent('登録申請を確認中です。管理者の承認をお待ちください。'));
+  }
+
+  if (profile?.status === 'disabled') {
+    await supabase.auth.signOut();
+    redirect('/login?error=' + encodeURIComponent('このアカウントは管理者によって停止されています。'));
+  }
+
+  const name = profile?.name || user.email?.split('@')[0] || 'Unknown';
+  const role = profile?.role || 'student';
+  const isAdmin = role === 'admin';
+  const level = calc_Lv_from_EXP(profile?.exp || 0).level;
+  const exp = profile?.exp || 0;
+  const avatarSeed = profile?.avatar_seed || 'LearnFlowUser123';
+
+  const orgRules: OrgRuleMap = (profile?.organizations as unknown as { rules: OrgRuleMap } | null)?.rules || {};
+  const effectiveRules = resolveEffectiveRules(orgRules, profile?.rule_overrides as RuleMap);
+  const pinnedTheme = resolveEffectivePinnedTheme(orgRules, profile?.rule_overrides as RuleMap);
+
+  return (
+    <NavLockProvider>
+    <MobileNavProvider>
+      <ThemeEnforcer pinnedTheme={pinnedTheme} />
+      <header className="h-16 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-4 md:px-6 shrink-0 z-20">
+        <div className="flex items-center gap-3 md:gap-4 min-w-0">
+          <MobileMenuButton />
+          <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-white font-bold shadow-lg shadow-brand-500/30 shrink-0">
+            L
+          </div>
+          <h1 className="text-xl font-black tracking-tight font-title text-slate-800 dark:text-white truncate">
+            Learn<span className="text-brand-600 dark:text-brand-400">Flow</span>
+            {isAdmin && <span className="ml-2 text-xs bg-rose-100 text-rose-700 px-2 py-0.5 rounded-full font-bold">Admin</span>}
+          </h1>
+        </div>
+
+        <div className="flex items-center gap-4 shrink-0">
+          <HeaderDropdown name={name} role={role} initialAvatarSeed={avatarSeed} />
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden relative z-10">
+        <MobileSidebarDrawer role={role} level={level} exp={exp} gamificationDisabled={effectiveRules.disable_gamification} />
+
+        <main className="flex-1 overflow-y-auto px-4 sm:px-8 md:px-20 py-4 h-[calc(100vh-4rem)] flex flex-col pb-16" id="main-content-scroll">
+          {children}
+
+          <SiteFooter showPolicyLinks />
+        </main>
+      </div>
+    </MobileNavProvider>
+    </NavLockProvider>
+  );
+}

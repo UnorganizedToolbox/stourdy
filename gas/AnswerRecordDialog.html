@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 13px; padding: 12px; }
+    label { display: block; margin-top: 10px; font-weight: bold; font-size: 12px; color: #444; }
+    select, input[type=text] { width: 100%; padding: 6px; margin-top: 4px; box-sizing: border-box; font-family: inherit; }
+    .hint { font-size: 11px; color: #777; margin-top: 2px; }
+    .result-group { display: flex; gap: 8px; margin-top: 6px; }
+    .result-group button { flex: 1; padding: 10px; font-size: 16px; border: 2px solid #ccc; background: #fff; cursor: pointer; border-radius: 6px; }
+    .result-group button.selected { border-color: #4285f4; background: #e8f0fe; }
+    .actions { margin-top: 16px; text-align: right; }
+    #submitBtn { background: #4285f4; color: #fff; border: none; border-radius: 4px; cursor: pointer; padding: 8px 16px; font-size: 13px; }
+    #submitBtn:disabled { background: #ccc; cursor: default; }
+    #status { margin-top: 8px; font-size: 12px; color: #d93025; min-height: 14px; white-space: pre-line; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <label for="student">生徒名</label>
+  <select id="student"></select>
+
+  <label for="book">参考書名</label>
+  <select id="book"></select>
+
+  <div id="typeBlock">
+    <label for="type">種別</label>
+    <select id="type"></select>
+  </div>
+
+  <div id="pageBlock">
+    <label for="page">ページ</label>
+    <input type="text" id="page" inputmode="numeric" placeholder="例: 34">
+  </div>
+
+  <label for="problem">問題番号</label>
+  <input type="text" id="problem" placeholder="例: 12、3-2、3-2-1">
+  <div class="hint">「大問-小問-小小問」の形式。小問・小小問は省略できます。</div>
+
+  <label>結果</label>
+  <div class="result-group">
+    <button type="button" data-value="〇" onclick="selectResult(this)">〇</button>
+    <button type="button" data-value="△" onclick="selectResult(this)">△</button>
+    <button type="button" data-value="×" onclick="selectResult(this)">×</button>
+  </div>
+
+  <div id="status"></div>
+  <div class="actions">
+    <button id="submitBtn" onclick="submitForm()">記録する</button>
+  </div>
+
+  <script>
+    var selectedResult = null;
+    var rules = [];
+
+    function selectResult(btn) {
+      document.querySelectorAll('.result-group button').forEach(function (b) { b.classList.remove('selected'); });
+      btn.classList.add('selected');
+      selectedResult = btn.dataset.value;
+    }
+
+    function populateSelect(id, items) {
+      var sel = document.getElementById(id);
+      sel.innerHTML = '';
+      items.forEach(function (v) {
+        var opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v;
+        sel.appendChild(opt);
+      });
+    }
+
+    // 選んだ参考書の決まりに合わせて、種別の選択肢とページ欄の表示を切り替える
+    function applyRule() {
+      var book = document.getElementById('book').value;
+      var rule = rules.filter(function (r) { return r.book === book; })[0];
+      var hasTypes = rule && rule.types.length > 0;
+      document.getElementById('typeBlock').classList.toggle('hidden', !hasTypes);
+      populateSelect('type', hasTypes ? rule.types : []);
+      document.getElementById('pageBlock').classList.toggle('hidden', !(rule && rule.usesPage));
+      if (!(rule && rule.usesPage)) document.getElementById('page').value = '';
+    }
+
+    document.getElementById('book').addEventListener('change', applyRule);
+
+    google.script.run.withSuccessHandler(function (names) {
+      populateSelect('student', names.length ? names : ['(生徒プロフィールが空です)']);
+    }).getStudentNames();
+
+    google.script.run.withSuccessHandler(function (data) {
+      rules = data;
+      populateSelect('book', data.length ? data.map(function (r) { return r.book; }) : ['(参考書マスターが空です)']);
+      applyRule();
+    }).getTextbookMasterData();
+
+    function submitForm() {
+      if (!selectedResult) {
+        document.getElementById('status').textContent = '結果(〇/△/×)を選んでください。';
+        return;
+      }
+      var typeHidden = document.getElementById('typeBlock').classList.contains('hidden');
+      document.getElementById('submitBtn').disabled = true;
+      document.getElementById('status').textContent = '記録中...';
+      google.script.run
+        .withSuccessHandler(function () { google.script.host.close(); })
+        .withFailureHandler(function (err) {
+          // サーバー側のthrowはmessageの先頭に「Error: 」が付いて届くため取り除く
+          document.getElementById('status').textContent = 'エラー: ' + String(err.message).replace(/^Error:\s*/, '');
+          document.getElementById('submitBtn').disabled = false;
+        })
+        .submitAnswerRecord({
+          studentName: document.getElementById('student').value,
+          book: document.getElementById('book').value,
+          type: typeHidden ? '' : document.getElementById('type').value,
+          page: document.getElementById('page').value,
+          problemNum: document.getElementById('problem').value,
+          result: selectedResult
+        });
+    }
+  </script>
+</body>
+</html>

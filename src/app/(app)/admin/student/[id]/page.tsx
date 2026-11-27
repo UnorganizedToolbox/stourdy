@@ -1,0 +1,179 @@
+export const dynamic = "force-dynamic";
+import { createClient } from "@/utils/supabase/server";
+import { redirect } from "next/navigation";
+import Link from "next/link";
+import { ArrowLeft, Clock, BarChart2, MessageCircle } from "lucide-react";
+import AdminStudentControls from "../../components/AdminStudentControls";
+import StudentRuleOverrides from "../../components/StudentRuleOverrides";
+import GradeRegisterForm from "../../components/GradeRegisterForm";
+import PomodoroStatsSwitcher from "../../../components/PomodoroStatsSwitcher";
+import { loadPomodoroAnalytics } from "@/lib/pomodoroAnalyticsLoader";
+import { formatJstDate } from "@/lib/formatDate";
+
+export default async function StudentDetailPage(props: { params: Promise<{ id: string }> }) {
+  const params = await props.params;
+  const studentId = params.id;
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+
+  // 以下はすべてuser.id・studentId(ルートパラメータ)だけに依存し互いに独立しているため
+  // 並列に取得する(以前は直列に5回問い合わせており、その分のレイテンシが積み重なっていた)。
+  // 認可チェック(adminProfile)より前にstudent等を取得するが、RLSが許可しない行は
+  // そもそも返らないため、未認可の閲覧者にデータが漏れることはない。
+  const [
+    { data: adminProfile },
+    { data: student, error: studentError },
+    { data: organizations },
+    { data: diagnostics },
+    { data: questions },
+  ] = await Promise.all([
+    supabase.from('profiles').select('role').eq('id', user?.id).single(),
+    supabase.from('profiles').select('*').eq('id', studentId).single(),
+    supabase.from('organizations').select('id, name').order('name'),
+    supabase.from('diagnostic_results').select('*').eq('student_uuid', studentId).order('created_at', { ascending: false }),
+    supabase.from('questions').select('*').eq('student_uuid', studentId).order('created_at', { ascending: false }),
+  ]);
+
+  if (adminProfile?.role !== 'admin' && adminProfile?.role !== 'teacher') redirect('/');
+  const viewerRole = adminProfile.role as 'admin' | 'teacher';
+
+  if (studentError || !student) {
+    return (
+      <div className="p-8 text-center text-slate-500">
+        生徒が見つかりませんでした。<br/>
+        <Link href="/admin" className="text-brand-600 hover:underline mt-4 inline-block">戻る</Link>
+      </div>
+    );
+  }
+
+  let studentOrgRules: Record<string, unknown> = {};
+  if (student.organization_id) {
+    const { data: studentOrg } = await supabase.from('organizations').select('rules').eq('id', student.organization_id).single();
+    studentOrgRules = (studentOrg?.rules as Record<string, unknown>) || {};
+  }
+
+  // ポモドーロの完了数・学習時間・最近の記録は、下部のPomodoroAnalyticsPanelと同じ
+  // pomodoro_events由来の集計(pomodoroAnalytics)から取る。かつては別途pomodoro_logsを
+  // 問い合わせていたが、2つのテーブルが別々のタイミングで書き込まれるため件数がずれる
+  // ことがあり、単一の集計結果に一本化した。student.roleに依存するため上の並列取得には含めない。
+  const pomodoroAnalytics = student.role === 'student' ? await loadPomodoroAnalytics(supabase, studentId) : null;
+
+  return (
+    <section className="flex-1 flex flex-col gap-6 max-w-[1200px] mx-auto w-full px-6 pt-2 pb-6">
+      <div className="flex items-center gap-4 mb-2">
+        <Link href="/admin" className="w-10 h-10 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500 hover:text-brand-600 hover:border-brand-300 transition-all shadow-sm">
+          <ArrowLeft className="w-5 h-5" />
+        </Link>
+        <div>
+          <div className="flex items-center gap-3">
+            <h2 className="text-2xl font-black font-title text-slate-800 dark:text-white">{student.name}</h2>
+            {student.status === 'pending' && (
+              <span className="px-2 py-1 rounded-md text-[10px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                承認待ち
+              </span>
+            )}
+            {student.status === 'disabled' && (
+              <span className="px-2 py-1 rounded-md text-[10px] font-bold bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400">
+                停止中
+              </span>
+            )}
+          </div>
+          <p className="text-sm text-slate-500 font-mono mt-1">ID: {student.student_id} | 登録日: {formatJstDate(student.created_at)}</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        {/* Diagnostics Card */}
+        <div className="card-glass bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm md:col-span-2">
+          <h3 className="font-bold text-lg text-slate-800 dark:text-white mb-4 flex items-center gap-2">
+            <BarChart2 className="w-5 h-5 text-brand-500" />
+            診断テスト履歴
+          </h3>
+          <div className="space-y-4">
+            {diagnostics && diagnostics.length > 0 ? (
+              diagnostics.map((diag, i) => (
+                <div key={diag.id} className="border border-slate-100 dark:border-slate-800 rounded-xl p-4 flex gap-6 items-center">
+                  <div className="text-center shrink-0">
+                    <div className="text-sm text-slate-500">第{diagnostics.length - i}回</div>
+                    <div className="text-2xl font-black text-brand-600 dark:text-brand-400">{diag.total_score}<span className="text-xs text-slate-400 font-normal">点</span></div>
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-xs text-slate-500 mb-1">受験日: {formatJstDate(diag.created_at)}</p>
+                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">弱点: {diag.weaknesses || '分析中'}</p>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <p className="text-sm text-slate-400">まだ診断テストを受験していません。</p>
+            )}
+          </div>
+        </div>
+
+        {/* Stats Column */}
+        <div className="flex flex-col gap-6">
+          <AdminStudentControls
+            studentId={student.id}
+            initialName={student.name}
+            initialLocked={!!student.nickname_locked}
+            initialStatus={student.status}
+            initialRole={student.role}
+            initialOrganizationId={student.organization_id}
+            organizations={organizations || []}
+            viewerRole={viewerRole}
+          />
+
+          {student.role === 'student' && (
+            <>
+              <StudentRuleOverrides studentId={student.id} initialOverrides={student.rule_overrides || {}} orgRules={studentOrgRules} />
+              <GradeRegisterForm studentId={student.id} />
+            </>
+          )}
+
+          <div className="card-glass bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
+            <h3 className="font-bold text-lg text-slate-800 dark:text-white mb-4 flex items-center gap-2">
+              <Clock className="w-5 h-5 text-brand-500" />
+              学習時間 (ポモドーロ)
+            </h3>
+            <div className="text-4xl font-black text-slate-800 dark:text-white mb-2">
+              {pomodoroAnalytics?.periods.cumulative.completedWork ?? 0} <span className="text-sm text-slate-500 font-normal">回完了</span>
+            </div>
+            <p className="text-xs text-slate-400 mb-4">
+              学習時間(実測): {((pomodoroAnalytics?.periods.cumulative.studyMinutes ?? 0) / 60).toFixed(1)} 時間(直近90日)
+            </p>
+
+            <div className="space-y-2 max-h-[200px] overflow-y-auto pr-2">
+              {(pomodoroAnalytics?.recentCompletions ?? []).map(c => (
+                <div key={c.completedAt} className="text-xs flex justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
+                  <span className="text-slate-600 dark:text-slate-300">{c.subject ?? '学習'}</span>
+                  <span className="text-slate-400">{formatJstDate(c.completedAt)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="card-glass bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
+            <h3 className="font-bold text-lg text-slate-800 dark:text-white mb-4 flex items-center gap-2">
+              <MessageCircle className="w-5 h-5 text-brand-500" />
+              質問履歴
+            </h3>
+            <div className="text-2xl font-black text-slate-800 dark:text-white mb-4">{questions?.length || 0} <span className="text-sm text-slate-500 font-normal">件</span></div>
+            
+            <div className="space-y-3 max-h-[200px] overflow-y-auto pr-2">
+              {questions && questions.map(q => (
+                <div key={q.id} className="text-xs p-2 bg-slate-50 dark:bg-slate-800/50 rounded-lg">
+                  <div className="flex justify-between mb-1">
+                    <span className="font-bold truncate max-w-[120px]" title={q.title}>{q.title}</span>
+                    <span className={q.status === 'open' ? 'text-amber-500' : 'text-emerald-500'}>{q.status === 'open' ? '未回答' : '回答済'}</span>
+                  </div>
+                  <span className="text-slate-400 text-[10px]">{formatJstDate(q.created_at)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {student.role === 'student' && <PomodoroStatsSwitcher analytics={pomodoroAnalytics} showFocusScore />}
+    </section>
+  );
+}

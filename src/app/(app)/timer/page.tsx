@@ -1,0 +1,100 @@
+import { signQaImages } from "@/lib/qaImages";
+export const dynamic = "force-dynamic";
+import { createClient } from "@/utils/supabase/server";
+import { redirect } from "next/navigation";
+import RealtimeQuestions from "./components/RealtimeQuestions";
+import PomodoroTimer from "./components/PomodoroTimer";
+import QAThreadList from "./components/QAThreadList";
+import AskQuestionForm from "./components/AskQuestionForm";
+import { resolveEffectiveRules, type RuleMap, type OrgRuleMap } from "@/lib/rules";
+
+export default async function TimerPage() {
+  const supabase = await createClient();
+
+  // configLogsはuser情報に依存しないので認証確認と並列に取得する
+  const [{ data: configLogs }, { data: { user } }] = await Promise.all([
+    supabase
+      .from('student_activity_logs')
+      .select('metadata')
+      .eq('activity_type', 'SYSTEM_CONFIG')
+      .order('created_at', { ascending: false })
+      .limit(1),
+    supabase.auth.getUser(),
+  ]);
+
+  const globalQuestionsEnabled = !(configLogs && configLogs.length > 0 && configLogs[0].metadata && (configLogs[0].metadata as any).questions_enabled === false);
+
+  if (!user) {
+    redirect('/login');
+  }
+
+  // プロフィールと所属団体のルールを1回の問い合わせで取得する(直列2回→1回)
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('grade_level, role, organization_id, rule_overrides, pomodoro_experiment_enabled, organizations:organization_id (rules)')
+    .eq('id', user.id)
+    .single();
+  const isTeacher = profile?.role === 'teacher';
+  const experimentEnabled = profile?.pomodoro_experiment_enabled ?? false;
+
+  const orgRules: OrgRuleMap = (profile?.organizations as unknown as { rules: OrgRuleMap } | null)?.rules || {};
+  const effectiveRules = resolveEffectiveRules(orgRules, profile?.rule_overrides as RuleMap);
+  const questionsEnabled = globalQuestionsEnabled && !effectiveRules.disable_questions;
+
+  // 教師には質問箱(生徒→教師の連絡手段)は不要なので、ポモドーロのみ表示する
+  if (isTeacher) {
+    return (
+      <section className="flex-1 flex flex-col gap-6 max-w-[700px] mx-auto w-full px-6 pt-2 pb-6">
+        <PomodoroTimer gradeLevel={null} experimentEnabled={experimentEnabled} />
+      </section>
+    );
+  }
+
+  // Fetch open questions for this user
+  const { data: questions } = await supabase
+    .from('questions')
+    .select('*')
+    .eq('student_uuid', user.id)
+    .order('created_at', { ascending: false });
+
+  return (
+    <section className="flex-1 flex flex-col gap-6 max-w-[1400px] mx-auto w-full px-6 pt-2 pb-6">
+      <div className="flex-1 grid grid-cols-12 gap-6 h-[calc(100vh-10rem)] min-h-[600px]">
+        {/* Left Column (Timer & Current task) */}
+        <div className="col-span-12 lg:col-span-7 flex flex-col gap-6">
+          <PomodoroTimer gradeLevel={profile?.grade_level ?? null} experimentEnabled={experimentEnabled} />
+          <RealtimeQuestions studentId={user.id} />
+        </div>
+
+        {/* Right Column (Q&A) */}
+        <div className="col-span-12 lg:col-span-5 flex flex-col gap-6">
+          <div className="card-glass flex-1 bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl flex flex-col overflow-hidden shadow-sm h-full max-h-[calc(100vh-10rem)]">
+            <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/20 flex justify-between items-center">
+              <h4 className="font-bold font-title text-contrast text-sm">質問箱 (Q&A)</h4>
+              <span className="text-[10px] bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 px-2 py-1 rounded font-bold">
+                {questions?.filter(q => q.status === 'open').length || 0}件 回答待ち
+              </span>
+            </div>
+            
+            <QAThreadList initialQuestions={await signQaImages(questions || [])} />
+            
+            
+            <div className="p-4 border-t border-slate-100 dark:border-slate-800 bg-white dark:bg-darkbg-secondary">
+              {!questionsEnabled ? (
+                <div className="p-4 bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-xl text-center">
+                  <p className="text-sm font-bold text-rose-600 dark:text-rose-400">
+                    <i className="fa-solid fa-circle-exclamation mr-1"></i>
+                    現在、質問の受付を一時停止しています。
+                  </p>
+                  <p className="text-xs text-rose-500/80 dark:text-rose-400/80 mt-1">教師の回答をお待ちいただくか、後ほどお試しください。</p>
+                </div>
+              ) : (
+                <AskQuestionForm />
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}

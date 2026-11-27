@@ -1,0 +1,372 @@
+import type { ReactNode } from "react";
+import type { FocusSessionScore, LatencyStats, PomodoroAnalytics } from "@/lib/pomodoroAnalytics";
+import PeriodStatsSwitcher from "./PeriodStatsSwitcher";
+
+const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
+const CARD_CLASS = "card-glass bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm flex flex-col gap-4";
+
+function formatSeconds(sec: number | null): string {
+  if (sec === null) return '—';
+  const s = Math.round(sec);
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  return m >= 10 || rest === 0 ? `${m}分` : `${m}分${rest}秒`;
+}
+
+function percent(rate: number | null): string {
+  return rate === null ? '—' : `${Math.round(rate * 100)}%`;
+}
+
+function rateOf(numerator: number, denominator: number): number | null {
+  return denominator === 0 ? null : numerator / denominator;
+}
+
+function decimal(value: number | null, digits = 1): string {
+  return value === null ? '—' : value.toFixed(digits);
+}
+
+export function Card({ title, note, children, className = '' }: { title: string; note?: string; children: ReactNode; className?: string }) {
+  return (
+    <div className={`${CARD_CLASS} ${className}`}>
+      <div>
+        <h4 className="font-bold font-title text-brand-600">{title}</h4>
+        {note && <p className="text-[11px] text-slate-400 mt-1">{note}</p>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+export function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-700/60 px-4 py-3">
+      <p className="text-[11px] text-slate-500 dark:text-slate-400">{label}</p>
+      <p className="text-xl font-black text-slate-800 dark:text-white">{value}</p>
+      {sub && <p className="text-[10px] text-slate-400 mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
+function MiniBars({ values, labels, maxValue, showValues = false, ariaLabel }: {
+  values: number[];
+  labels: string[];
+  maxValue?: number;
+  showValues?: boolean;
+  ariaLabel: string;
+}) {
+  const max = maxValue ?? Math.max(...values, 0);
+  return (
+    <div role="img" aria-label={ariaLabel} className="flex items-end gap-1 h-24">
+      {values.map((v, i) => (
+        <div key={i} className="flex-1 min-w-0 h-full flex flex-col justify-end items-center gap-1" title={`${labels[i]}: ${v}`}>
+          {showValues && <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400">{v}</span>}
+          <div
+            className={`w-full rounded-t ${v > 0 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-slate-700'}`}
+            style={{ height: v > 0 && max > 0 ? `${Math.max((v / max) * 70, 4)}%` : '2px' }}
+          />
+          <span className="text-[9px] text-slate-400 leading-none h-2 truncate max-w-full">{labels[i]}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const OUTCOME_LABEL: Record<FocusSessionScore['outcome'], string> = {
+  completed: '完走',
+  stopped: '中止',
+  abandoned: 'タブを閉じた等',
+  unfinished: '放置',
+};
+
+const BGM_LABEL: Record<string, string> = { none: 'なし', white: 'ホワイト', pink: 'ピンク', brown: 'ブラウン' };
+
+function formatJst(iso: string): string {
+  return new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function shortDate(label: string): string {
+  const [, m, d] = label.split('-');
+  return `${Number(m)}/${Number(d)}`;
+}
+
+function penaltyText(p: FocusSessionScore['penalties']): string {
+  const parts: string[] = [];
+  if (p.check > 0.5) parts.push(`時間確認 -${Math.round(p.check)}`);
+  if (p.pause > 0.5) parts.push(`一時停止 -${Math.round(p.pause)}`);
+  if (p.transition > 0.5) parts.push(`再開の遅れ -${Math.round(p.transition)}`);
+  return parts.length > 0 ? parts.join(' / ') : '減点なし';
+}
+
+// ロバストZの目安を言葉にする(±0.5未満は「いつも通り」)
+function zLabel(z: number | null): string {
+  if (z === null) return '—';
+  const rounded = Math.round(z * 10) / 10;
+  const delta = rounded === 0 ? '±0.0' : `${rounded > 0 ? '+' : ''}${rounded.toFixed(1)}`;
+  if (z >= 1) return `いつもより高い(${delta})`;
+  if (z >= 0.5) return `やや高い(${delta})`;
+  if (z > -0.5) return `いつも通り(${delta})`;
+  if (z > -1) return `やや低い(${delta})`;
+  return `いつもより低い(${delta})`;
+}
+
+const LATENCY_BUCKETS: { key: keyof LatencyStats['buckets']; label: string; className: string }[] = [
+  { key: 'within10s', label: '10秒以内', className: 'bg-emerald-500' },
+  { key: 'within1m', label: '1分以内', className: 'bg-sky-500' },
+  { key: 'within5m', label: '5分以内', className: 'bg-amber-500' },
+  { key: 'over5m', label: '5分超', className: 'bg-rose-500' },
+];
+
+function LatencyBlock({ title, stats }: { title: string; stats: LatencyStats }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex justify-between items-baseline gap-2 flex-wrap">
+        <span className="text-sm font-bold text-slate-700 dark:text-slate-200">{title}</span>
+        <span className="text-xs text-slate-500 dark:text-slate-400">
+          中央値 <b className="text-base font-black text-brand-600 dark:text-brand-400">{formatSeconds(stats.medianSec)}</b>
+          <span className="ml-2">平均 {formatSeconds(stats.meanSec)}</span>
+        </span>
+      </div>
+      {stats.count > 0 ? (
+        <>
+          <div className="flex w-full h-2.5 rounded-full overflow-hidden bg-slate-200 dark:bg-slate-700">
+            {LATENCY_BUCKETS.map(b => stats.buckets[b.key] > 0 && (
+              <div key={b.key} className={b.className} style={{ width: `${(stats.buckets[b.key] / stats.count) * 100}%` }} />
+            ))}
+          </div>
+          <ul className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500 dark:text-slate-400">
+            {LATENCY_BUCKETS.map(b => (
+              <li key={b.key} className="flex items-center gap-1.5">
+                <span className={`inline-block w-2 h-2 rounded-full ${b.className}`} />
+                {b.label} {stats.buckets[b.key]}回
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : (
+        <p className="text-xs text-slate-400">計測できたデータがまだありません</p>
+      )}
+      {stats.noResumeCount > 0 && (
+        <p className="text-[11px] text-slate-400">30分以内に次を始めず終了: {stats.noResumeCount}回(上の集計には含めていません)</p>
+      )}
+    </div>
+  );
+}
+
+export default function PomodoroAnalyticsPanel({ analytics, showFocusScore = false }: {
+  analytics: PomodoroAnalytics | null;
+  // 暫定の集中度スコアを表示するか。生徒本人には出さず、教師・管理者向けの画面のみで使う
+  showFocusScore?: boolean;
+}) {
+  if (!analytics) {
+    return (
+      <Card title="学習習慣と集中の分析">
+        <p className="text-sm text-slate-500">分析データを取得できませんでした。時間をおいて再度お試しください。</p>
+      </Card>
+    );
+  }
+  if (!analytics.hasData) {
+    return (
+      <Card title="学習習慣と集中の分析">
+        <p className="text-sm text-slate-500">データ収集中... ポモドーロを実行すると、習慣や集中の傾向がここに表示されます。</p>
+      </Card>
+    );
+  }
+
+  const { habit, transitions, completion, focus, bySubject, periods, focusScore } = analytics;
+  const hourLabels = habit.byHour.map((_, h) => (h % 6 === 0 ? String(h) : ''));
+  const workInterruptions = completion.workStopped + completion.workAbandoned + completion.workUnfinished;
+
+  // 曜日別の完了率(サンプルが少ない曜日は除いて最低/最高だけ見せる)
+  const weekdayRates = WEEKDAY_LABELS
+    .map((label, i) => ({ label, started: habit.byWeekdayStarted[i], rate: rateOf(habit.byWeekday[i], habit.byWeekdayStarted[i]) }))
+    .filter((w): w is { label: string; started: number; rate: number } => w.started >= 3 && w.rate !== null);
+  const bestWeekday = weekdayRates.length > 0 ? weekdayRates.reduce((a, b) => (b.rate > a.rate ? b : a)) : null;
+  const worstWeekday = weekdayRates.length > 0 ? weekdayRates.reduce((a, b) => (b.rate < a.rate ? b : a)) : null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div>
+        <h3 className="text-lg font-bold font-title text-slate-800 dark:text-white">学習習慣と集中の分析</h3>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          ポモドーロの操作ログから集計しています(時刻は日本時間)。
+        </p>
+      </div>
+
+      <Card title="連続・累計・週毎・月毎" note="完了率・学習時間・平均評価など、期間で区切って見られる指標はここで切り替えて確認できます">
+        <PeriodStatsSwitcher periods={periods} showFocusScore={showFocusScore} />
+      </Card>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card title="学習習慣のパターン" note="時間帯・曜日・1回の学習でのまとまりなど、期間を区切らない傾向です">
+          <div className="grid grid-cols-2 gap-3">
+            <Stat label="現在の連続日数" value={`${habit.currentStreak}日`} sub={`最長 ${habit.longestStreak}日(履歴全体)`} />
+            <Stat label="1回の学習での連続数" value={`平均 ${decimal(habit.avgPomosPerSession)}回`} sub={`最長 ${habit.maxPomosInSession}回(1時間以内の間隔で続けたもの)`} />
+          </div>
+          <div>
+            <p className="text-xs font-bold text-slate-600 dark:text-slate-300 mb-2">始めた時間帯(時)</p>
+            <MiniBars values={habit.byHour} labels={hourLabels} ariaLabel="作業を始めた時間帯ごとの完了数" />
+          </div>
+          <div>
+            <p className="text-xs font-bold text-slate-600 dark:text-slate-300 mb-2">曜日別の完了数</p>
+            <MiniBars values={habit.byWeekday} labels={WEEKDAY_LABELS} showValues ariaLabel="曜日ごとの完了数" />
+            {bestWeekday && worstWeekday && bestWeekday.label !== worstWeekday.label && (
+              <p className="text-[11px] text-slate-400 mt-2">
+                完了率が最も高いのは{bestWeekday.label}曜({percent(bestWeekday.rate)})、最も低いのは{worstWeekday.label}曜({percent(worstWeekday.rate)})です。
+              </p>
+            )}
+          </div>
+        </Card>
+
+        <div className="flex flex-col gap-6">
+          <Card title="切り替えの速さ" note="タイマーが終わってから、次のスタートボタンを押すまでの時間です(押し間違いの開始は含みません)">
+            <LatencyBlock title="作業が終わってから休憩を始めるまで" stats={transitions.workEndToBreakStart} />
+            <LatencyBlock title="休憩が終わってから作業を始めるまで" stats={transitions.breakEndToWorkStart} />
+            {transitions.ratingInputMedianSec !== null && (
+              <p className="text-[11px] text-slate-400">
+                作業後の時間には、集中度を入力する時間(中央値 {formatSeconds(transitions.ratingInputMedianSec)})が含まれます。
+              </p>
+            )}
+          </Card>
+
+          <Card title="完了率の内訳" note="完了率そのものは上の「連続・累計・週毎・月毎」を、途中で終わった理由の内訳はここを見てください">
+            <ul className="text-xs text-slate-500 dark:text-slate-400 flex flex-col gap-1">
+              {workInterruptions > 0 && (
+                <li>
+                  途中で終わった作業 {workInterruptions}回
+                  (中止 {completion.workStopped} / タブを閉じた等 {completion.workAbandoned} / 一時停止のまま放置など {completion.workUnfinished})
+                </li>
+              )}
+              <li>作業後に休憩を取らず終えた回数 {completion.quitBeforeBreak}回</li>
+              <li>休憩後に次の作業を始めず終えた回数 {completion.quitBeforeWork}回</li>
+            </ul>
+            <div className="grid grid-cols-2 gap-3">
+              <Stat label="通常休憩(5分)の完了率" value={percent(completion.shortBreakCompletionRate)} />
+              <Stat label="大休憩(15分)の完了率" value={percent(completion.longBreakCompletionRate)} sub="低いと、せっかくの大休憩を取らず進んでいるかも" />
+            </div>
+          </Card>
+
+          <Card title="集中の指標" note="残り時間を確認した/しなかった作業で、自己申告の集中度評価に違いがあるかの比較です">
+            <div className="grid grid-cols-2 gap-3">
+              <Stat label="集中度評価の件数" value={`${focus.ratingCount}回`} sub={focus.ratingSkippedCount > 0 ? `スキップ ${focus.ratingSkippedCount}回` : undefined} />
+              <Stat
+                label="確認の有無で比べた集中度"
+                value={focus.avgRatingWithChecks === null ? '—' : `${decimal(focus.avgRatingWithoutChecks)} / ${decimal(focus.avgRatingWithChecks)}`}
+                sub={focus.avgRatingWithChecks === null ? '各3回以上たまると表示されます' : '確認なし / 確認あり'}
+              />
+            </div>
+          </Card>
+        </div>
+      </div>
+
+      {showFocusScore && (
+        <Card
+          title="集中度スコア(暫定)の内訳"
+          note="操作ログ(残り時間の確認・一時停止・休憩後の再開の遅れ・中断)だけから機械的に計算した、暫定のたたき台です。係数は実データがたまってから統計的に決め直す予定で、生徒への報酬(EXP等)には使っていません。実際に動かした時間が1分未満のもの(押し間違い)は集計から除いています。平均値は上の「連続・累計・週毎・月毎」で確認できます。"
+        >
+          <Stat
+            label="最新の完走セッション(本人比)"
+            value={zLabel(focusScore.latestRobustZ)}
+            sub={focusScore.baseline
+              ? `本人の直近${focusScore.baseline.n}回の中央値 ${Math.round(focusScore.baseline.median)}点と比較`
+              : '完走が5回たまると本人基準で比較できます'}
+          />
+
+          <div>
+            <p className="text-xs font-bold text-slate-600 dark:text-slate-300 mb-2">日ごとの有効集中時間(分。集中度×作業時間の合計)</p>
+            {focusScore.daily.every(d => d.sessions === 0) ? (
+              <p className="text-xs text-slate-400">直近14日にスコアを付けられるセッションがありません</p>
+            ) : (
+              <MiniBars
+                values={focusScore.daily.map(d => Math.round(d.effectiveFocusMin))}
+                labels={focusScore.daily.map((d, i) => (i % 2 === 0 ? shortDate(d.date) : ''))}
+                ariaLabel="日ごとの有効集中時間"
+              />
+            )}
+            <p className="text-[11px] text-slate-400 mt-2">例: 80点のセッションを25分×4回で80分。回数をこなすほど増えるので、疲れた後半のセッションが平均を下げる問題を避けられます。</p>
+          </div>
+
+          {focusScore.recentSessions.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-[11px] text-slate-400 border-b border-slate-100 dark:border-slate-800">
+                    <th className="py-2 pr-3 font-bold">開始</th>
+                    <th className="py-2 pr-3 font-bold">科目</th>
+                    <th className="py-2 pr-3 font-bold">BGM</th>
+                    <th className="py-2 pr-3 font-bold text-right">結果</th>
+                    <th className="py-2 pr-3 font-bold text-right">点数</th>
+                    <th className="py-2 font-bold">減点の内訳</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {focusScore.recentSessions.map(s => (
+                    <tr key={s.startedAt} className="border-b border-slate-50 dark:border-slate-800/60 text-slate-700 dark:text-slate-200">
+                      <td className="py-2 pr-3 whitespace-nowrap">{formatJst(s.startedAt)}</td>
+                      <td className="py-2 pr-3">{s.subject ?? '—'}</td>
+                      <td className="py-2 pr-3">{s.bgm === null ? '—' : (BGM_LABEL[s.bgm] ?? s.bgm)}</td>
+                      <td className="py-2 pr-3 text-right whitespace-nowrap">{OUTCOME_LABEL[s.outcome]}{s.runningMin > 0 ? `(${Math.round(s.runningMin)}分)` : ''}</td>
+                      <td className="py-2 pr-3 text-right font-bold">{Math.round(s.score)}</td>
+                      <td className="py-2 text-[11px] text-slate-500 dark:text-slate-400">{penaltyText(s.penalties)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {focusScore.byBgm.length > 0 && (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              BGM別の平均(完走のみ):{' '}
+              {focusScore.byBgm.map(b => `${BGM_LABEL[b.bgm] ?? b.bgm} ${Math.round(b.avgScore)}点(${b.sessions}回)`).join(' / ')}
+              <span className="text-slate-400">　※BGMの記録は2026-09-20以降のセッションのみ。回数が少ないうちは参考程度にしてください。</span>
+            </p>
+          )}
+        </Card>
+      )}
+
+      <Card title="科目別の完了率と集中度">
+        {bySubject.length === 0 ? (
+          <p className="text-sm text-slate-500">まだ集計できる作業の記録がありません。</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-[11px] text-slate-400 border-b border-slate-100 dark:border-slate-800">
+                  <th className="py-2 pr-4 font-bold">科目</th>
+                  <th className="py-2 pr-4 font-bold text-right">作業回数</th>
+                  <th className="py-2 pr-4 font-bold text-right">完了率</th>
+                  <th className="py-2 font-bold text-right">集中度の平均</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bySubject.map(s => (
+                  <tr key={s.subject} className="border-b border-slate-50 dark:border-slate-800/60 text-slate-700 dark:text-slate-200">
+                    <td className="py-2 pr-4 font-bold">{s.subject}</td>
+                    <td className="py-2 pr-4 text-right">{s.segments}回</td>
+                    <td className="py-2 pr-4 text-right">{percent(s.completionRate)}<span className="text-[11px] text-slate-400 ml-1">({s.completed}/{s.segments})</span></td>
+                    <td className="py-2 text-right">{decimal(s.avgRating)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      <details className="text-xs text-slate-500 dark:text-slate-400">
+        <summary className="cursor-pointer font-bold">指標の定義と注意点</summary>
+        <ul className="list-disc pl-5 mt-2 flex flex-col gap-1">
+          <li>完了 = タイマーが最後まで進んだ区間。中止・タブを閉じた・一時停止のまま放置(最後の操作から2時間以上)は「途中で終わった」として数えます。</li>
+          <li>実際に動かした時間(一時停止を除く)が1分未満の作業は、押し間違いとみなして完了率・集中度スコア・切り替えの速さなど作業区間の集計に含めません。動かした時間が測れない放置・タブを閉じた場合は除外せず数えます。</li>
+          <li>切り替えの速さ = タイマー完了から次のスタートボタンまで。30分以内に次を始めなかった場合は「再開せず終了」として除外します。</li>
+          <li>1回の学習 = 前の作業が終わってから1時間以内に次の作業を始めた、ひと続きのまとまり。</li>
+          <li>集中度の平均には「スキップ(普通とする)」を含めません。ただしスキップの記録を始める前のデータは、本当の「3」と区別できません。</li>
+          <li>「連続・累計・週毎・月毎」は取得できた履歴全体(最大90日分)で集計しています。「連続」は活動が途切れず並んだ日の範囲ごと、「週毎」は直近7日間隔、「月毎」はカレンダー月です。</li>
+          <li>学習時間は25分固定ではなく、実際の開始〜完了の時間から計算しています(将来ポモドーロの長さが変わっても正しく集計されるようにするため)。</li>
+          <li>数値は行動の記録から見た傾向で、能力や意欲の優劣を示すものではありません。</li>
+        </ul>
+      </details>
+    </div>
+  );
+}

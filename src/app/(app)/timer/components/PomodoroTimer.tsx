@@ -1,0 +1,904 @@
+'use client'
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { logPomodoro, logPomodoroEvent, getTodayPomoCount, logStudySession } from '../actions';
+import { cn } from '@/lib/utils';
+import { PartyPopper, Lock } from 'lucide-react';
+import { getSoundPref, getBgmPref, renderAlarmBlobUrl, renderNoiseBlobUrl, type SoundType, type BgmType, type NoiseType } from '@/lib/pomodoroAudio';
+import { getSubjectOptions, OTHER_SUBJECT, type GradeLevel } from '@/lib/subjects';
+import { useNavLock } from '../../components/NavLockContext';
+import {
+  advanceCycle,
+  readCycleState,
+  resolveCycleState,
+  shouldAutoEndIdleSession,
+  writeCycleState,
+} from '@/lib/pomodoroCycle';
+
+type TimerMode = 'WORK' | 'BREAK' | 'LONG_BREAK';
+
+const WORK_TIME = 25 * 60;
+const BREAK_TIME = 5 * 60;
+const LONG_BREAK_TIME = 15 * 60;
+// 実行中のタイマーがStartしたまま終了予定時刻をこれだけ超過して放置された場合、
+// 「タブを閉じた/中断した」とみなす。大休憩の判定サイクル(pomodoroCycle.ts)は
+// これとは別に、Cookie自体の有効期限(モードの所要時間+25分)で中断を判定する。
+const ABANDON_THRESHOLD_MS = 20 * 60 * 1000;
+const STORAGE_KEY = 'learnflow_pomodoro_state_v1';
+
+function durationFor(mode: TimerMode) {
+  return mode === 'WORK' ? WORK_TIME : mode === 'LONG_BREAK' ? LONG_BREAK_TIME : BREAK_TIME;
+}
+
+// ポモドーロ時間可変化の実験用(CLAUDE.local.md参照)。固定25/5/15分にも動的調整にも実証的
+// 根拠がないため、いきなりアルゴリズムで調整するのではなく、まずこの範囲内でランダムに
+// 時間を変えてログを集め、本当に差が出るかを検証する段階。pomodoro_experiment_enabledが
+// 有効なアカウントでのみ使われ、それ以外は従来通りdurationFor(固定値)を使う。
+const WORK_RANGE_MIN = [15, 20, 25, 30, 40];
+const BREAK_RANGE_MIN = [3, 5, 7, 10];
+const LONG_BREAK_RANGE_MIN = [10, 15, 20];
+
+function pickRandomMinutes(options: number[]): number {
+  return options[Math.floor(Math.random() * options.length)] * 60;
+}
+
+function randomDurationFor(mode: TimerMode): number {
+  if (mode === 'WORK') return pickRandomMinutes(WORK_RANGE_MIN);
+  if (mode === 'LONG_BREAK') return pickRandomMinutes(LONG_BREAK_RANGE_MIN);
+  return pickRandomMinutes(BREAK_RANGE_MIN);
+}
+
+type PersistedState = {
+  mode: TimerMode;
+  targetEndTime: number | null;
+  isRunning: boolean;
+  timeLeft: number;
+  sessionId: string | null;
+  awaitingDecision: boolean;
+  // 作業完了直後、集中度評価モーダルの表示中にリロード/タブの再読み込みが起きても
+  // 「評価待ち」であることを見失わないようにするためのフラグ(2026-09-27追加)。
+  // これが無いと、リロード後は素の「開始」ボタンが出てしまい、押すと
+  // timeLeft=0のまま同じsession_idでSTARTが記録され、直後に(実質1秒未満で)
+  // 再度COMPLETEしてしまう「幽霊ポモドーロ」(二重カウント・二重EXP付与)が発生していた。
+  showRatingModal: boolean;
+  dateKey: string;
+};
+
+// ローカル日付(YYYY-MM-DD)。実行中セッション等の繰り越し判定に使う。
+// 「今日の回数」バッジ自体はlocalStorageに保存せず、常にDBから取得する
+// (重要なバグ修正: 以前はpomoCountもlocalStorageに保存していたため、
+// 日をまたいでも古い回数が残り続けたり、逆にこの日付判定を追加した際に
+// 「今日保存されたが日付情報を持たない古い形式のデータ」を一律「古い」と
+// 誤判定して今日の分まで0にリセットしてしまう問題があった)。
+function todayKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function startOfTodayISO(): string {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+function loadPersistedState(): PersistedState | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) as PersistedState : null;
+  } catch {
+    return null;
+  }
+}
+
+function savePersistedState(state: PersistedState) {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // localStorage が使えない環境(プライベートモード等)では無視する
+  }
+}
+
+function clearPersistedState() {
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+
+function speakText(text: string) {
+  try {
+    if ('speechSynthesis' in window) {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'ja-JP';
+      utterance.rate = 1.0;
+      utterance.pitch = 1.2;
+      window.speechSynthesis.speak(utterance);
+    }
+  } catch (e) {
+    console.error("Speech synthesis failed", e);
+  }
+}
+
+export default function PomodoroTimer({ gradeLevel, experimentEnabled = false }: { gradeLevel: GradeLevel | null; experimentEnabled?: boolean }) {
+  const subjectOptions = getSubjectOptions(gradeLevel);
+  // 実験モードが有効な場合だけ範囲内でランダムな時間を選ぶ。無効なら従来通りの固定値。
+  const resolveDuration = useCallback(
+    (m: TimerMode) => (experimentEnabled ? randomDurationFor(m) : durationFor(m)),
+    [experimentEnabled],
+  );
+  const [studyProblemCount, setStudyProblemCount] = useState('');
+  const [studyCorrectCount, setStudyCorrectCount] = useState('');
+  const [studyDifficulty, setStudyDifficulty] = useState<number | null>(null);
+  const [studyNote, setStudyNote] = useState('');
+  const [studyFile, setStudyFile] = useState<File | null>(null);
+  const [timeLeft, setTimeLeft] = useState(WORK_TIME);
+  const [targetEndTime, setTargetEndTime] = useState<number | null>(null);
+  const workerRef = React.useRef<Worker | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [mode, setMode] = useState<TimerMode>('WORK');
+  const [subject, setSubject] = useState(subjectOptions[0]);
+  const [customSubject, setCustomSubject] = useState('');
+  const effectiveSubject = subject === OTHER_SUBJECT ? (customSubject.trim() || OTHER_SUBJECT) : subject;
+  const [levelUpData, setLevelUpData] = useState<{oldLevel: number, newLevel: number, rewardStones: number} | null>(null);
+  const [pomoCount, setPomoCount] = useState(0);
+  const [showTime, setShowTime] = useState(false);
+  // アラーム音・BGMの種類は設定画面で選ぶ。タイマー実行中に切り替えると
+  // バックグラウンド再生の「解錠」がやり直しになり不安定になるため、ここでは変更不可。
+  const [soundType] = useState<SoundType>(() => getSoundPref());
+  const [bgmType] = useState<BgmType>(() => getBgmPref());
+  const [showRatingModal, setShowRatingModal] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [awaitingDecision, setAwaitingDecision] = useState(false);
+  const [autoEndedNotice, setAutoEndedNotice] = useState<string | null>(null);
+  const hasHydratedRef = useRef(false);
+  // マウント直後(localStorageからの復元が終わるまで)は、本来のタイマー画面を描画しない。
+  // SSR中はwindow/localStorageが無いため、timeLeft等の初期値は常にデフォルト(25:00・停止中)
+  // になるが、これをそのまま描画してしまうと、何らかの理由でこのコンポーネントが再マウント
+  // された場合に「一瞬だけ25:00・停止中の画面が見える→直後に復元されて元に戻る」という
+  // 「タイマーがリセットされたように見える」症状の原因になる(2026-10-11調査)。代わりに
+  // 復元が終わるまでは中立なローディング表示に留め、間違った状態を一切描画しないようにする。
+  const [isHydrated, setIsHydrated] = useState(false);
+  const { lock, unlock } = useNavLock();
+
+  // 開始・一時停止・決定待ち画面に入る等、「今まさに操作した」タイミングで呼ぶ。
+  // sinceLongBreakのカウント自体は変えず、Cookieの有効期限だけを
+  // 「(このあと過ごすことになる)モードの所要時間+25分」で延長し直す
+  // (Cookie自体が失効していれば中断とみなして0から数え直す。pomodoroCycle.ts参照)。
+  const touchActivity = useCallback((relevantModeDurationSec: number) => {
+    writeCycleState(resolveCycleState(readCycleState()), relevantModeDurationSec * 1000);
+  }, []);
+
+  // 作業を1回完了した時点で、次が大休憩かどうかをCookie上のサイクルから判定し、
+  // 次に迎える休憩の所要時間を基準にCookieの有効期限を設定したうえで結果だけを返す
+  // (Cookieが失効していれば0から数え直す)。
+  const advanceCycleForCompletion = useCallback((): boolean => {
+    const { next, isLongBreak } = advanceCycle(readCycleState());
+    writeCycleState(next, (isLongBreak ? LONG_BREAK_TIME : BREAK_TIME) * 1000);
+    return isLongBreak;
+  }, []);
+
+  const bgmAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const alarmAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const alarmUrlCacheRef = useRef<Partial<Record<SoundType, string>>>({});
+  const noiseUrlCacheRef = useRef<Partial<Record<NoiseType, string>>>({});
+  // 「残り時間を確認する」で表示した時刻(mm:ss)を自動的に隠すまでの締切(絶対時刻)。
+  // 単発のsetTimeoutだけに頼ると、何らかの理由で発火しなかった場合に表示が
+  // 戻らなくなる不具合が報告されたため、下のwatchdog(1秒おき)でも締切を確認して
+  // 自己修復できるようにする(setTimeoutは即応性のための一次経路として残す)。
+  const showTimeUntilRef = useRef<number | null>(null);
+
+  const getAlarmUrl = useCallback(async (type: SoundType) => {
+    if (!alarmUrlCacheRef.current[type]) {
+      alarmUrlCacheRef.current[type] = await renderAlarmBlobUrl(type);
+    }
+    return alarmUrlCacheRef.current[type]!;
+  }, []);
+
+  const getNoiseUrl = useCallback(async (type: NoiseType) => {
+    if (!noiseUrlCacheRef.current[type]) {
+      noiseUrlCacheRef.current[type] = await renderNoiseBlobUrl(type);
+    }
+    return noiseUrlCacheRef.current[type]!;
+  }, []);
+
+  // 選択中の音色・BGMをあらかじめ裏でレンダリング/キャッシュしておく。
+  // これにより「開始」を押した瞬間には既に生成済みで、ユーザー操作から
+  // 間を置かずに play() を呼べる(ブラウザの自動再生ポリシー対策)。
+  useEffect(() => { void getAlarmUrl(soundType); }, [soundType, getAlarmUrl]);
+  useEffect(() => { void getNoiseUrl(bgmType === 'none' ? 'silent' : bgmType); }, [bgmType, getNoiseUrl]);
+
+  useEffect(() => {
+    const alarmCache = alarmUrlCacheRef.current;
+    const noiseCache = noiseUrlCacheRef.current;
+    return () => {
+      Object.values(alarmCache).forEach(url => url && URL.revokeObjectURL(url));
+      Object.values(noiseCache).forEach(url => url && URL.revokeObjectURL(url));
+    };
+  }, []);
+
+  // タイマー開始(ユーザー操作)のタイミングで、BGM要素とアラーム要素の両方を
+  // 一度再生→アラームは即座に一時停止して「解錠」しておく。BGMが「なし」でも
+  // ごく微小な音量のループを鳴らし続け、バックグラウンドでの再生資格を維持する。
+  const startAudioForSession = useCallback(async () => {
+    const noiseType: NoiseType = bgmType === 'none' ? 'silent' : bgmType;
+    const [noiseUrl, alarmUrl] = await Promise.all([getNoiseUrl(noiseType), getAlarmUrl(soundType)]);
+
+    const bgmEl = bgmAudioElRef.current;
+    if (bgmEl) {
+      bgmEl.src = noiseUrl;
+      bgmEl.loop = true;
+      bgmEl.volume = bgmType === 'none' ? 0.02 : 0.5;
+      try { await bgmEl.play(); } catch (e) { console.error('BGM playback failed', e); }
+    }
+
+    const alarmEl = alarmAudioElRef.current;
+    if (alarmEl) {
+      alarmEl.src = alarmUrl;
+      alarmEl.volume = 1.0;
+      try {
+        await alarmEl.play();
+        alarmEl.pause();
+        alarmEl.currentTime = 0;
+      } catch (e) {
+        console.error('Alarm priming failed', e);
+      }
+    }
+
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'stourdy ポモドーロタイマー',
+        artist: mode === 'WORK' ? '集中中...' : '休憩中...',
+      });
+    }
+  }, [bgmType, soundType, getNoiseUrl, getAlarmUrl, mode]);
+
+  const stopSessionAudio = useCallback(() => {
+    bgmAudioElRef.current?.pause();
+  }, []);
+
+  const playAlarm = useCallback(() => {
+    stopSessionAudio();
+    const alarmEl = alarmAudioElRef.current;
+    if (alarmEl) {
+      alarmEl.currentTime = 0;
+      void alarmEl.play().catch((e) => console.error('Alarm playback failed', e));
+    }
+  }, [stopSessionAudio]);
+
+  const handleTimerComplete = useCallback(() => {
+    playAlarm();
+    if (sessionId) void logPomodoroEvent(sessionId, mode, 'COMPLETE');
+
+    if (mode === 'WORK') {
+      speakText("ポモドーロが終了しました。集中度を評価してください。");
+      setShowRatingModal(true);
+      // 作業完了の時点でもCookieを延長する(開始時に延長していても、長い作業のあとに
+      // 失効している可能性があるため。評価送信後は次の休憩基準で改めて設定される)。
+      touchActivity(WORK_TIME);
+    } else {
+      speakText("休憩が終わりました。次のポモドーロを開始しましょう。");
+      setMode('WORK');
+      setTimeLeft(resolveDuration('WORK'));
+      setTargetEndTime(null);
+      setAwaitingDecision(true);
+      // 「次の学習を始める」決定待ち画面に入った瞬間。次はWORKなので、その所要時間+25分を
+      // 有効期限としてCookieを延長しておく(マウント時の復元処理を参照)。
+      touchActivity(WORK_TIME);
+    }
+  }, [playAlarm, mode, sessionId, touchActivity, resolveDuration]);
+
+  // 「今日: N 回」バッジは常にDB(pomodoro_events、完了した作業(WORK)の件数)から取得する。localStorageの
+  // pomoCountには一切依存しない(日をまたいでも古い回数が残ったり、逆に
+  // まだDBに書き込み中の今日の分まで誤って0にリセットする、といった問題を
+  // 構造的に避けるため)。
+  useEffect(() => {
+    void getTodayPomoCount(startOfTodayISO()).then(setPomoCount);
+  }, []);
+
+  // 初回マウント時: リロード等で失われたタイマー状態(実行中セッション・
+  // 休憩/次の学習の開始待ち状態)を localStorage から復元する。保存時の日付
+  // (dateKey)が今日と違う場合は、前日以前の状態とみなして破棄する。
+  //
+  // 放置(中断)の検出は2パターンある:
+  // ①実行中(isRunning)だった場合: タイマーの終了予定時刻から ABANDON_THRESHOLD_MS 以上
+  //   経過していれば「タブを閉じた」とみなし、ABANDONED イベントを記録して破棄する。
+  // ②決定待ち画面(休憩を始める/次の学習を始める、のボタン待ち)や一時停止のまま
+  //   だった場合: 従来は放置検出が一切なかった(いつまでも同じ画面が復元され続けた)。
+  //   ここでは大休憩サイクル用のCookie(pomodoroCycle.ts)が生きているかどうかを見る。
+  //   Cookieの有効期限は「そのときのモードの所要時間+25分」で設定されているため、
+  //   その期間を過ぎて放置されていれば読めなくなっており、中断とみなして新しい学習開始画面
+  //   から始め直させる(自然に0から数え直しになる)。
+  useEffect(() => {
+    const saved = loadPersistedState();
+    const now = Date.now();
+
+    if (saved) {
+      const isStale = saved.dateKey !== todayKey();
+
+      if (saved.isRunning && saved.targetEndTime) {
+        const overdueMs = now - saved.targetEndTime;
+        if (overdueMs > ABANDON_THRESHOLD_MS || isStale) {
+          if (saved.sessionId) {
+            void logPomodoroEvent(saved.sessionId, saved.mode, 'ABANDONED', { overdue_seconds: Math.round(overdueMs / 1000) });
+          }
+          clearPersistedState();
+          if (!isStale) setAutoEndedNotice('長時間操作がなかったため、前回のセッションは自動的に終了しました。');
+        } else {
+          setMode(saved.mode);
+          setSessionId(saved.sessionId);
+          setTargetEndTime(saved.targetEndTime);
+          setTimeLeft(Math.max(0, Math.round((saved.targetEndTime - now) / 1000)));
+          setIsRunning(true);
+        }
+      } else if (!isStale && readCycleState() !== null) {
+        setMode(saved.mode);
+        setTimeLeft(saved.timeLeft);
+        setSessionId(saved.sessionId);
+        setAwaitingDecision(saved.awaitingDecision);
+        // 集中度評価モーダルの表示中にリロードされた場合、これを復元しないと
+        // 「評価待ち」であることを見失い、素の「開始」ボタン(timeLeft=0のまま同じ
+        // session_idを再利用)が出てしまい、直後に再度COMPLETEしてしまう
+        // 「幽霊ポモドーロ」の原因になる(2026-09-27発見)。
+        setShowRatingModal(!!saved.showRatingModal);
+        // 無事に復元できた=まだ操作中とみなし、このモードを基準に有効期限を延長し直す
+        touchActivity(durationFor(saved.mode));
+      } else {
+        if (!isStale && saved.sessionId) {
+          void logPomodoroEvent(saved.sessionId, saved.mode, 'QUIT', { declined_mode: saved.mode, auto: true });
+          setAutoEndedNotice('長時間操作がなかったため、前回のセッションは自動的に終了しました。');
+        }
+        clearPersistedState();
+      }
+    } else {
+      // 保存状態が全く無い(初回訪問、またはlocalStorageが空)場合は、ここで初めて
+      // このモード(WORK)の所要時間を確定する。実験モードが有効なら、ここで
+      // ランダムな時間が選ばれる。
+      setTimeLeft(resolveDuration('WORK'));
+    }
+
+    hasHydratedRef.current = true;
+    setIsHydrated(true);
+  }, [touchActivity, resolveDuration]);
+
+  // 現在のタイマー状態を localStorage に保存し、リロード後も復元できるようにする
+  // (pomoCountは含めない。常にDBが正のため)
+  useEffect(() => {
+    if (!hasHydratedRef.current) return;
+    savePersistedState({ mode, targetEndTime, isRunning, timeLeft, sessionId, awaitingDecision, showRatingModal, dateKey: todayKey() });
+  }, [mode, targetEndTime, isRunning, timeLeft, sessionId, awaitingDecision, showRatingModal]);
+
+
+  // Setup Web Worker for accurate background timing (bypasses iOS Safari throttling)
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const workerCode = `
+        let timer = null;
+        self.onmessage = function(e) {
+          if (e.data === 'start') {
+            if (timer) clearInterval(timer);
+            timer = setInterval(() => self.postMessage('tick'), 500);
+          } else if (e.data === 'stop') {
+            if (timer) clearInterval(timer);
+            timer = null;
+          }
+        };
+      `;
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(blob);
+      workerRef.current = new Worker(workerUrl);
+      
+      // Request Notification permission for background alerts
+      if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission();
+      }
+
+      return () => {
+        workerRef.current?.terminate();
+        URL.revokeObjectURL(workerUrl);
+      };
+    }
+  }, []);
+
+  // Timer Tick Logic (Driven by Web Worker OR fallback interval)
+  useEffect(() => {
+    const tick = () => {
+      if (isRunning && targetEndTime) {
+        const now = Date.now();
+        const remaining = Math.max(0, Math.round((targetEndTime - now) / 1000));
+        setTimeLeft(remaining);
+        
+        if (remaining <= 0) {
+          setIsRunning(false);
+          setTargetEndTime(null);
+          workerRef.current?.postMessage('stop');
+          handleTimerComplete();
+          
+          // Trigger background notification for iOS/Desktop
+          if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification("ポモドーロ完了！", {
+              body: mode === 'WORK' ? "集中セッションが完了しました。休憩しましょう！" : "休憩が終了しました。学習を再開しましょう！",
+              icon: '/icon.png'
+            });
+          }
+        }
+      }
+    };
+
+    let fallbackInterval: NodeJS.Timeout;
+    if (isRunning && targetEndTime) {
+      if (workerRef.current) {
+        workerRef.current.onmessage = tick;
+        workerRef.current.postMessage('start');
+      } else {
+        fallbackInterval = setInterval(tick, 500);
+      }
+    } else {
+      workerRef.current?.postMessage('stop');
+    }
+
+    return () => {
+      if (fallbackInterval) clearInterval(fallbackInterval);
+      if (workerRef.current) workerRef.current.onmessage = null;
+    };
+  }, [isRunning, targetEndTime, mode, handleTimerComplete]);
+
+  // 見張り役(watchdog): 「残り時間を確認する」ボタンを押した後などに、何らかの理由で
+  // Web Workerからのtickメッセージ(または主経路のフォールバックinterval)が届かなくなり、
+  // 表示が一時停止→再開するまで固まったままになる不具合が報告されたための対策。
+  // targetEndTime(絶対時刻)を基準に1秒おきに表示を再計算するだけなので、主経路が
+  // 正常な場合はsetTimeLeftが同じ値を返すだけで実害はない。完了処理そのもの
+  // (handleTimerCompleteの呼び出し等)は主経路のtickに任せる(ここで二重に行うと
+  // mode/handleTimerCompleteへの依存が増え、Reactコンパイラの手動メモ化検証が壊れて
+  // 他のuseCallbackまで最適化がスキップされてしまうため、あえて含めない)。
+  // 主経路が本当に止まっている場合に備え、残り時間が0以下になった時点でWorkerへ
+  // 'start'を再送し、主経路自身に完了処理をさせるよう促す。
+  useEffect(() => {
+    if (!isRunning || !targetEndTime) return;
+    const watchdog = setInterval(() => {
+      const remaining = Math.max(0, Math.round((targetEndTime - Date.now()) / 1000));
+      setTimeLeft(remaining);
+      if (remaining <= 0) {
+        workerRef.current?.postMessage('start');
+      }
+      // 「残り時間を確認する」の自動非表示(3秒後)も、単発setTimeoutの取りこぼしに
+      // 備えてここで自己修復する。
+      if (showTimeUntilRef.current !== null && Date.now() >= showTimeUntilRef.current) {
+        showTimeUntilRef.current = null;
+        setShowTime(false);
+      }
+    }, 1000);
+    return () => clearInterval(watchdog);
+  }, [isRunning, targetEndTime]);
+
+  // タイマー実行中は他の画面へ移動されると集中が途切れるため、サイドバー等の
+  // ナビゲーションを封じる(設定・不具合報告は例外)。
+  useEffect(() => {
+    if (isRunning) {
+      lock();
+      return () => unlock();
+    }
+  }, [isRunning, lock, unlock]);
+
+
+  const handleRatingSubmit = (rating: number, skipped = false) => {
+    setShowRatingModal(false);
+    if (sessionId) void logPomodoroEvent(sessionId, 'WORK', 'RATING_SUBMITTED', skipped ? { rating, skipped: true } : { rating });
+
+    // 先に休憩画面へ切り替える。DB書き込み(logPomodoro/実績評価)の完了は待たない。
+    // 「今日: N回」バッジは引き続きDB(pomoCount)基準のまま。大休憩の判定だけは
+    // Cookie(pomodoroCycle.ts)上の連続回数で決める(中断していれば自動的に0から数え直す)。
+    const isLongBreak = advanceCycleForCompletion();
+    setPomoCount(pomoCount + 1);
+    setMode(isLongBreak ? 'LONG_BREAK' : 'BREAK');
+    setTimeLeft(isLongBreak ? resolveDuration('LONG_BREAK') : resolveDuration('BREAK'));
+    setTargetEndTime(null);
+    setAwaitingDecision(true);
+
+    // 記録とレベルアップ判定はバックグラウンドで実行し、結果が来たらモーダルで通知する
+    logPomodoro(effectiveSubject, 25, rating)
+      .then((res) => {
+        if (res?.levelUp) setLevelUpData(res.levelUp);
+      })
+      .catch((e) => {
+        console.error("Failed to log pomodoro", e);
+      });
+
+    // 実験モード: 解いた問題数・難易度等の自由記録ログ(何か入力されている場合のみ送信)
+    if (experimentEnabled && sessionId && (studyProblemCount || studyCorrectCount || studyDifficulty !== null || studyNote || studyFile)) {
+      const fd = new FormData();
+      fd.set('session_id', sessionId);
+      if (studyProblemCount) fd.set('problem_count', studyProblemCount);
+      if (studyCorrectCount) fd.set('correct_count', studyCorrectCount);
+      if (studyDifficulty !== null) fd.set('difficulty', String(studyDifficulty));
+      if (studyNote) fd.set('note', studyNote);
+      if (studyFile) fd.set('file', studyFile);
+      void logStudySession(fd).catch((e) => console.error('Failed to log study session', e));
+      setStudyProblemCount('');
+      setStudyCorrectCount('');
+      setStudyDifficulty(null);
+      setStudyNote('');
+      setStudyFile(null);
+    }
+  };
+
+  const toggleTimer = () => {
+    if (!isRunning) {
+      // timeLeftが0以下のまま「開始」が押されるケースへの防御(2026-09-27発見)。
+      // 本来は決定待ち画面/評価モーダルに遷移しているはずだが、リロード等でそれを
+      // 見失った状態で古いsession_id・timeLeft=0のまま再開されると、即座(1秒未満)に
+      // 再度COMPLETEしてしまう「幽霊ポモドーロ」(完了数の二重カウント・EXPの二重付与)
+      // が発生していた。この場合は新しいセッションとして、そのモードの満タンの時間
+      // から始め直す。
+      const needsFreshStart = timeLeft <= 0;
+      const isFreshSegment = !sessionId || awaitingDecision || needsFreshStart;
+      const sid = isFreshSegment ? crypto.randomUUID() : sessionId!;
+      if (isFreshSegment) setSessionId(sid);
+      const startTimeLeft = needsFreshStart ? resolveDuration(mode) : timeLeft;
+      if (needsFreshStart) setTimeLeft(startTimeLeft);
+      setAwaitingDecision(false);
+      setAutoEndedNotice(null); // 新しく始めたら「自動終了しました」の表示は消す
+      // 開始・再開の時点でCookieを延長する。ここで延長しないと、決定待ちで長く待ってから
+      // 始めた場合や初回の作業で、実行中にCookieが無い/失効している状態になり得る。
+      touchActivity(durationFor(mode));
+      setIsRunning(true);
+      setTargetEndTime(Date.now() + startTimeLeft * 1000);
+      void startAudioForSession(); // ユーザー操作のタイミングで BGM・アラームを解錠する
+      // scheduled_seconds: 予定時間(集中度スコアを作業時間非依存にするため。実験モードで
+      // ランダムに選ばれた時間もこれで正しく記録される。startTimeLeftを再利用し、
+      // durationFor/resolveDurationを呼び直さない(呼び直すと実験モード時に実際の
+      // カウントダウンと違う値を記録してしまう)。bgm: このセッションで流したBGMの種類
+      // (BGMと集中度の関係を後から分析するため。音量は固定値でユーザー設定ではないので記録しない)。
+      void logPomodoroEvent(sid, mode, 'START', {
+        scheduled_seconds: startTimeLeft,
+        bgm: bgmType,
+        ...(mode === 'WORK' ? { subject: effectiveSubject } : {}),
+      });
+    } else {
+      setIsRunning(false);
+      setTargetEndTime(null);
+      workerRef.current?.postMessage('stop');
+      stopSessionAudio();
+      if (sessionId) void logPomodoroEvent(sessionId, mode, 'PAUSE');
+      // 一時停止した瞬間、今のモードの所要時間+25分を基準にCookieの有効期限を延長し直す
+      // (この画面で放置されたら、その期間を過ぎた時点で中断とみなす)。
+      touchActivity(durationFor(mode));
+    }
+  };
+
+  const handleStop = () => {
+    stopSessionAudio();
+    if (sessionId) void logPomodoroEvent(sessionId, mode, 'STOP');
+    setIsRunning(false);
+    setTargetEndTime(null);
+    setTimeLeft(resolveDuration(mode));
+    setAwaitingDecision(false);
+    setSessionId(null);
+  };
+
+  // 決定待ち画面・一時停止画面を、手動("終了する"ボタン)または自動(放置検出)で終える共通処理。
+  const endCurrentSession = useCallback((auto: boolean) => {
+    if (sessionId) {
+      void logPomodoroEvent(sessionId, mode, 'QUIT', auto ? { declined_mode: mode, auto: true } : { declined_mode: mode });
+    }
+    setAwaitingDecision(false);
+    setMode('WORK');
+    setTimeLeft(resolveDuration('WORK'));
+    setTargetEndTime(null);
+    setIsRunning(false);
+    setSessionId(null);
+    clearPersistedState();
+    if (auto) setAutoEndedNotice('長時間操作がなかったため、前回のセッションは自動的に終了しました。');
+  }, [sessionId, mode, resolveDuration]);
+
+  const handleQuit = () => endCurrentSession(false);
+
+  // タブを開いたまま長時間放置された場合、リロードしなくても自動的に終了できるようにする。
+  // マウント時のチェック(上のuseEffect)だけだと、開いたままのタブでは何も起きないため、
+  // 決定待ち・一時停止の間だけ、大休憩サイクル用Cookie(pomodoroCycle.ts)の有効期限切れを
+  // 定期的に確認する(実行中はWeb Worker側のタイマーが別途面倒を見ているので対象外)。
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const shouldEnd = shouldAutoEndIdleSession({
+        isRunning,
+        hasSession: sessionId !== null,
+        awaitingDecision,
+        showRatingModal,
+        cycleAlive: readCycleState() !== null,
+      });
+      if (shouldEnd) endCurrentSession(true);
+    }, 30 * 1000);
+    return () => clearInterval(interval);
+  }, [isRunning, sessionId, awaitingDecision, showRatingModal, endCurrentSession]);
+
+  const minutes = Math.floor(timeLeft / 60);
+  const seconds = timeLeft % 60;
+
+  const isWork = mode === 'WORK';
+  const modeLabel = mode === 'WORK' ? '集中 (25分)' : mode === 'LONG_BREAK' ? '大休憩 (15分)' : '休憩 (5分)';
+
+  // localStorageからの復元が終わるまでは、デフォルト値(25:00・停止中)をそのまま出さない。
+  // 外枠のサイズ・配色は本来の画面と揃え、レイアウトのガタつきだけは避ける。
+  if (!isHydrated) {
+    return (
+      <div className="card-glass border rounded-3xl p-10 flex flex-col items-center justify-center shadow-lg relative overflow-hidden flex-1 min-h-[400px] bg-white dark:bg-darkbg-secondary border-slate-200 dark:border-slate-800">
+        <div className="w-64 h-64 rounded-full border-8 border-slate-100 dark:border-slate-800 flex items-center justify-center">
+          <span className="text-sm font-bold text-slate-300 dark:text-slate-700 animate-pulse">読み込み中…</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <audio ref={bgmAudioElRef} playsInline className="hidden" />
+      <audio ref={alarmAudioElRef} playsInline className="hidden" />
+      <div className={cn(
+        "card-glass border rounded-3xl p-10 flex flex-col items-center justify-center shadow-lg relative overflow-hidden flex-1 min-h-[400px] transition-colors duration-1000",
+        isWork
+          ? "bg-white dark:bg-darkbg-secondary border-slate-200 dark:border-slate-800"
+          : "bg-emerald-50/50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-900/50"
+      )}>
+        <div className="w-full flex flex-wrap items-center justify-between gap-3 mb-6 z-20">
+          <span className={cn(
+            "px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm transition-all shrink-0",
+            isWork ? "bg-brand-500 text-white" : "bg-emerald-500 text-white"
+          )}>
+            現在のモード: {modeLabel}
+          </span>
+
+          <span className="text-xs font-bold text-slate-400 py-1 shrink-0">今日: {pomoCount} 回</span>
+        </div>
+
+        {autoEndedNotice && (
+          <div className="w-full mb-4 px-4 py-2.5 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 text-amber-700 dark:text-amber-400 text-xs font-bold flex items-center justify-between gap-3 z-20">
+            <span>{autoEndedNotice}</span>
+            <button onClick={() => setAutoEndedNotice(null)} className="shrink-0 opacity-60 hover:opacity-100">
+              閉じる
+            </button>
+          </div>
+        )}
+
+        {isWork && (
+          <div className="mb-6 flex flex-col items-center gap-2 z-10 transition-opacity">
+            <label className="text-xs font-bold text-slate-500">学習科目</label>
+            <select
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              disabled={isRunning}
+              className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-brand-500"
+            >
+              {subjectOptions.map(opt => (
+                <option key={opt} value={opt}>{opt}</option>
+              ))}
+            </select>
+            {subject === OTHER_SUBJECT && (
+              <input
+                type="text"
+                value={customSubject}
+                onChange={(e) => setCustomSubject(e.target.value)}
+                disabled={isRunning}
+                placeholder="科目名を入力"
+                className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-brand-500 w-40 text-center"
+              />
+            )}
+          </div>
+        )}
+
+        <div className={cn(
+          "w-64 h-64 rounded-full border-8 flex flex-col items-center justify-center relative mb-8 transition-colors duration-1000",
+          isWork 
+            ? (isRunning ? "border-brand-400 dark:border-brand-500" : "border-slate-100 dark:border-slate-800")
+            : (isRunning ? "border-emerald-400 dark:border-emerald-500" : "border-emerald-100 dark:border-emerald-900/50")
+        )}>
+          {isWork && isRunning && !showTime ? (
+            <div className="flex flex-col items-center justify-center text-slate-400 z-10">
+              <Lock className="w-12 h-12 mb-2 opacity-50" />
+              <span className="text-xl font-bold tracking-widest opacity-50">集中</span>
+            </div>
+          ) : (
+            <span className={cn(
+              "text-6xl font-black font-title tracking-tighter z-10",
+              isWork ? "text-slate-800 dark:text-white" : "text-emerald-700 dark:text-emerald-400"
+            )}>
+              {String(minutes).padStart(2, '0')}:{String(seconds).padStart(2, '0')}
+            </span>
+          )}
+          
+          <span className={cn(
+            "text-sm font-bold mt-2 z-10",
+            isWork ? "text-slate-600 dark:text-slate-300" : "text-emerald-700 dark:text-emerald-300"
+          )}>
+            {mode === 'WORK' ? '集中モード' : mode === 'LONG_BREAK' ? '大休憩' : 'リラックス'}
+          </span>
+        </div>
+
+        {isWork && !showTime && isRunning ? (
+          <button
+            onClick={() => {
+              setShowTime(true);
+              showTimeUntilRef.current = Date.now() + 3000;
+              // 念のためWorkerに'start'を再送する(冪等。内部のsetIntervalを張り直すだけなので、
+              // 正常に動いている場合は無害)。
+              workerRef.current?.postMessage('start');
+              if (sessionId) void logPomodoroEvent(sessionId, mode, 'CHECK_REMAINING_TIME');
+              setTimeout(() => {
+                showTimeUntilRef.current = null;
+                setShowTime(false);
+              }, 3000);
+            }}
+            className="mb-8 text-xs font-bold bg-slate-100 dark:bg-slate-800 text-slate-500 px-4 py-2 rounded-full hover:bg-slate-200 transition-colors"
+          >
+            残り時間を確認する
+          </button>
+        ) : (
+          <div className="mb-8 h-8"></div>
+        )}
+
+        {awaitingDecision && !isRunning ? (
+          <div className="flex gap-4 w-full max-w-sm z-10">
+            <button
+              onClick={toggleTimer}
+              className={cn(
+                "flex-1 py-4 text-white rounded-2xl font-bold font-title text-lg shadow-md transition-all active:scale-95",
+                isWork ? "bg-brand-600 hover:bg-brand-700 shadow-brand-500/20" : "bg-emerald-600 hover:bg-emerald-700 shadow-emerald-500/20"
+              )}
+            >
+              <i className="fa-solid fa-play mr-2"></i>
+              {isWork ? '学習を再開する' : mode === 'LONG_BREAK' ? '大休憩を開始する' : '休憩を開始する'}
+            </button>
+            <button
+              onClick={handleQuit}
+              className="flex-none px-6 py-4 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-2xl font-bold shadow-md transition-all active:scale-95"
+            >
+              終了する
+            </button>
+          </div>
+        ) : (
+          <div className="flex gap-4 w-full max-w-sm z-10">
+            <button
+              onClick={toggleTimer}
+              className={cn(
+                "flex-1 py-4 text-white rounded-2xl font-bold font-title text-lg shadow-md transition-all active:scale-95",
+                isRunning
+                  ? "bg-amber-500 hover:bg-amber-600 shadow-amber-500/20"
+                  : (isWork ? "bg-brand-600 hover:bg-brand-700 shadow-brand-500/20" : "bg-emerald-600 hover:bg-emerald-700 shadow-emerald-500/20")
+              )}
+            >
+              {isRunning ? <><i className="fa-solid fa-pause mr-2"></i> 一時停止</> : <><i className="fa-solid fa-play mr-2"></i> 開始</>}
+            </button>
+
+            {(isRunning || sessionId) && (
+              <button
+                onClick={handleStop}
+                className="flex-none px-6 py-4 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-2xl font-bold shadow-md transition-all active:scale-95"
+              >
+                <i className="fa-solid fa-stop mr-2"></i> 中止
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {levelUpData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-in fade-in duration-300">
+          <div className="bg-white dark:bg-darkbg-primary rounded-3xl p-8 max-w-sm w-full shadow-2xl flex flex-col items-center text-center relative overflow-hidden animate-in zoom-in-95 duration-500">
+            <div className="absolute top-0 left-0 w-full h-32 bg-gradient-to-b from-brand-500/20 to-transparent"></div>
+            <div className="w-20 h-20 bg-gradient-to-tr from-brand-400 to-brand-600 rounded-full flex items-center justify-center shadow-lg shadow-brand-500/30 mb-6 relative z-10 border-4 border-white dark:border-darkbg-primary">
+              <PartyPopper className="w-10 h-10 text-white" />
+            </div>
+            <h3 className="text-3xl font-black font-title text-slate-800 dark:text-white mb-2 z-10">LEVEL UP!</h3>
+            <div className="flex items-center gap-4 text-xl font-bold font-mono text-slate-500 mb-6 z-10">
+              <span className="opacity-50 line-through">Lv.{levelUpData.oldLevel}</span>
+              <i className="fa-solid fa-arrow-right text-brand-500"></i>
+              <span className="text-3xl text-brand-500">Lv.{levelUpData.newLevel}</span>
+            </div>
+            <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-2xl p-4 w-full mb-6 z-10">
+              <p className="text-xs font-bold text-amber-600 dark:text-amber-500 mb-2">レベルアップ報酬</p>
+              <div className="flex items-center justify-center gap-2 text-2xl font-black text-amber-500">
+                <i className="fa-solid fa-gem"></i>
+                +{levelUpData.rewardStones} <span className="text-sm">個</span>
+              </div>
+            </div>
+            <button onClick={() => setLevelUpData(null)} className="w-full py-4 bg-slate-800 hover:bg-slate-900 dark:bg-slate-200 dark:hover:bg-white text-white dark:text-slate-900 rounded-2xl font-bold transition-all active:scale-95 z-10 shadow-lg">閉じる</button>
+          </div>
+        </div>
+      )}
+
+      {showRatingModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-in fade-in duration-300">
+          <div className="bg-white dark:bg-darkbg-primary rounded-3xl p-8 max-w-sm w-full shadow-2xl flex flex-col items-center text-center animate-in zoom-in-95 duration-500">
+            <h3 className="text-2xl font-black font-title text-slate-800 dark:text-white mb-4">集中度の評価</h3>
+            <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">今回のポモドーロセッションの集中度を1(低)〜5(高)で評価してください。</p>
+            <div className="flex gap-3 mb-6 w-full justify-center">
+              {[1, 2, 3, 4, 5].map(rating => (
+                <button
+                  key={rating}
+                  onClick={() => handleRatingSubmit(rating)}
+                  className="w-12 h-12 rounded-full flex items-center justify-center bg-slate-100 hover:bg-brand-100 dark:bg-slate-800 dark:hover:bg-brand-900/30 text-slate-700 dark:text-slate-300 hover:text-brand-600 dark:hover:text-brand-400 text-xl font-bold transition-all active:scale-90 border-2 border-transparent hover:border-brand-500"
+                >
+                  {rating}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => handleRatingSubmit(3, true)}
+              className="text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 underline underline-offset-4"
+            >
+              スキップ（普通とする）
+            </button>
+
+            {experimentEnabled && (
+              <div className="w-full mt-6 pt-6 border-t border-slate-100 dark:border-slate-800 flex flex-col gap-3 text-left">
+                <p className="text-xs font-bold text-slate-500 dark:text-slate-400">
+                  実験用の学習ログ(任意。上の評価ボタンを押すと一緒に送信されます)
+                </p>
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className="block text-[11px] font-bold text-slate-400 mb-1">解いた問題数</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={studyProblemCount}
+                      onChange={(e) => setStudyProblemCount(e.target.value)}
+                      className="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="block text-[11px] font-bold text-slate-400 mb-1">うち正解数</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={studyCorrectCount}
+                      onChange={(e) => setStudyCorrectCount(e.target.value)}
+                      className="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-400 mb-1">難易度(1:易しい 〜 5:難しい)</label>
+                  <div className="flex gap-2">
+                    {[1, 2, 3, 4, 5].map(d => (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => setStudyDifficulty(d)}
+                        className={cn(
+                          "flex-1 py-1.5 rounded-lg text-xs font-bold border",
+                          studyDifficulty === d
+                            ? "bg-brand-600 text-white border-brand-600"
+                            : "bg-white dark:bg-slate-800 text-slate-500 border-slate-300 dark:border-slate-700"
+                        )}
+                      >
+                        {d}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-400 mb-1">メモ</label>
+                  <textarea
+                    value={studyNote}
+                    onChange={(e) => setStudyNote(e.target.value)}
+                    rows={2}
+                    className="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-400 mb-1">問題・ノートの写真(任意)</label>
+                  <input
+                    type="file"
+                    accept="image/*,.pdf"
+                    onChange={(e) => setStudyFile(e.target.files?.[0] ?? null)}
+                    className="w-full text-xs"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}

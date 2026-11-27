@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 13px; padding: 12px; }
+    label { display: block; margin-top: 10px; font-weight: bold; font-size: 12px; color: #444; }
+    select, input[type=text], textarea { width: 100%; padding: 6px; margin-top: 4px; box-sizing: border-box; font-family: inherit; }
+    textarea { height: 70px; resize: vertical; }
+    .actions { margin-top: 16px; text-align: right; }
+    #submitBtn { background: #4285f4; color: #fff; border: none; border-radius: 4px; cursor: pointer; padding: 8px 16px; font-size: 13px; }
+    #submitBtn:disabled { background: #ccc; cursor: default; }
+    #status { margin-top: 8px; font-size: 12px; color: #d93025; min-height: 14px; }
+  </style>
+</head>
+<body>
+  <label for="student">生徒名</label>
+  <select id="student"></select>
+
+  <label for="plan">今週の計画</label>
+  <textarea id="plan" placeholder="例: 青チャート数学IA 例題12〜20を解き直す"></textarea>
+
+  <label for="tutor">担当講師</label>
+  <input type="text" id="tutor" placeholder="例: 田中講師">
+
+  <div id="status"></div>
+  <div class="actions">
+    <button id="submitBtn" onclick="submitForm()">記録する</button>
+  </div>
+
+  <script>
+    function populateSelect(id, items) {
+      var sel = document.getElementById(id);
+      sel.innerHTML = '';
+      items.forEach(function (v) {
+        var opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v;
+        sel.appendChild(opt);
+      });
+    }
+
+    google.script.run.withSuccessHandler(function (names) {
+      populateSelect('student', names.length ? names : ['(生徒プロフィールが空です)']);
+    }).getStudentNames();
+
+    function submitForm() {
+      var plan = document.getElementById('plan').value.trim();
+      if (!plan) {
+        document.getElementById('status').textContent = '計画内容を入力してください。';
+        return;
+      }
+      document.getElementById('submitBtn').disabled = true;
+      document.getElementById('status').textContent = '記録中...';
+      google.script.run
+        .withSuccessHandler(function () { google.script.host.close(); })
+        .withFailureHandler(function (err) {
+          // サーバー側のthrowはmessageの先頭に「Error: 」が付いて届くため取り除く
+          document.getElementById('status').textContent = 'エラー: ' + String(err.message).replace(/^Error:\s*/, '');
+          document.getElementById('submitBtn').disabled = false;
+        })
+        .submitWeeklyPlan({
+          studentName: document.getElementById('student').value,
+          planText: plan,
+          tutorName: document.getElementById('tutor').value.trim()
+        });
+    }
+  </script>
+</body>
+</html>

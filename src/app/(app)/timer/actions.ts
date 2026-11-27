@@ -1,0 +1,424 @@
+'use server'
+
+import { createClient } from "@/utils/supabase/server";
+import { createAdminClient } from "@/utils/supabase/admin";
+import { revalidatePath } from "next/cache";
+import { evaluateAchievements } from "@/lib/gamification/engine";
+import { resolveEffectiveRules, type RuleMap, type OrgRuleMap } from "@/lib/rules";
+import { FAVORITE_QUESTION_LIMIT, RESOLVED_QUESTION_RETENTION_LIMIT, RESOLVED_QUESTION_RETENTION_DAYS } from "@/lib/qaLimits";
+import { countCompletedWork } from "@/lib/pomodoroAnalyticsLoader";
+import { qaImagePath } from "@/lib/qaImages";
+
+
+// 解決済みかつお気に入りでない質問のうち、(a) 保持件数の上限を超えた分、または
+// (b) 作成から一定日数(RESOLVED_QUESTION_RETENTION_DAYS)経過した分を、
+// 画像(storage)ごと削除する。お気に入りは件数・日数どちらの対象からも常に除外される。
+// RLSの owner 制約(教師が投稿した返信画像など)を気にせず確実に削除できるよう
+// service_role クライアントを使う。
+async function cleanupOldResolvedQuestions(studentId: string) {
+  const supabase = await createClient();
+  const { data: eligible } = await supabase
+    .from('questions')
+    .select('id, image_url, replies, created_at')
+    .eq('student_uuid', studentId)
+    .eq('status', 'resolved')
+    .eq('is_favorited', false)
+    .order('created_at', { ascending: false });
+
+  if (!eligible || eligible.length === 0) return;
+
+  const cutoff = Date.now() - RESOLVED_QUESTION_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const beyondCountCap = eligible.slice(RESOLVED_QUESTION_RETENTION_LIMIT);
+  const beyondAgeCap = eligible.filter(q => new Date(q.created_at).getTime() < cutoff);
+
+  const toDeleteById = new Map<string, (typeof eligible)[number]>();
+  for (const q of [...beyondCountCap, ...beyondAgeCap]) toDeleteById.set(q.id, q);
+  const toDelete = Array.from(toDeleteById.values());
+
+  if (toDelete.length === 0) return;
+
+  const imagePaths: string[] = [];
+  for (const q of toDelete) {
+    if (q.image_url) {
+      const p = qaImagePath(q.image_url);
+      if (p) imagePaths.push(p);
+    }
+    for (const r of (q.replies as { image_url?: string | null }[] | null) || []) {
+      if (r.image_url) {
+        const p = qaImagePath(r.image_url);
+        if (p) imagePaths.push(p);
+      }
+    }
+  }
+
+  const adminClient = createAdminClient();
+  if (imagePaths.length > 0) {
+    const { error: storageError } = await adminClient.storage.from('qa_images').remove(imagePaths);
+    if (storageError) console.error('Failed to remove old QA images', storageError);
+  }
+
+  const { error: deleteError } = await adminClient.from('questions').delete().in('id', toDelete.map(q => q.id));
+  if (deleteError) console.error('Failed to delete old resolved questions', deleteError);
+}
+
+export async function askQuestion(formData: FormData) {
+  const supabase = await createClient();
+
+  // Check if questions are disabled by admin
+  const { data: configLogs } = await supabase
+    .from('student_activity_logs')
+    .select('metadata')
+    .eq('activity_type', 'SYSTEM_CONFIG')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (configLogs && configLogs.length > 0 && configLogs[0].metadata) {
+    const meta = configLogs[0].metadata as any;
+    if (meta.questions_enabled === false) {
+      throw new Error('現在、管理者によって質問の受付が一時的に停止されています。');
+    }
+  }
+
+  // --- End Check ---
+
+  const title = formData.get('title') as string;
+  const body = formData.get('body') as string;
+  const image = formData.get('image') as File | null;
+
+  if (!title || !body) throw new Error('タイトルと内容は必須です');
+
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) throw new Error('ログインしていません');
+
+  const { data: askerProfile } = await supabase.from('profiles').select('organization_id, rule_overrides').eq('id', user.id).single();
+  let orgRules: OrgRuleMap = {};
+  if (askerProfile?.organization_id) {
+    const { data: org } = await supabase.from('organizations').select('rules').eq('id', askerProfile.organization_id).single();
+    orgRules = (org?.rules as OrgRuleMap) || {};
+  }
+  const effective = resolveEffectiveRules(orgRules, askerProfile?.rule_overrides as RuleMap);
+  if (effective.disable_questions) {
+    throw new Error('教師/管理者によって質問の投稿が禁止されています。');
+  }
+
+  // April Fools Easter Egg
+  const today = new Date();
+  const isAprilFirst = today.getMonth() === 3 && today.getDate() === 1;
+  const isAprilFoolTag = title.includes('#Aprilfool') || body.includes('#Aprilfool');
+
+  let image_url = null;
+
+  if (image && image.size > 0) {
+    const fileExt = image.name.split('.').pop();
+    const fileName = `${user.id}-${Math.random().toString(36).substring(2)}-${Date.now()}.${fileExt}`;
+    const filePath = `questions/${fileName}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('qa_images')
+      .upload(filePath, image);
+
+    if (uploadError) {
+      console.error('Failed to upload image', uploadError);
+      throw new Error(`画像のアップロードに失敗しました: ${uploadError.message}`);
+    }
+
+    // バケットは非公開。パスだけを保存し、表示時に署名URLへ差し替える(src/lib/qaImages.ts)
+    image_url = filePath;
+  }
+
+  // Easter Egg Intercept
+  if (isAprilFirst && isAprilFoolTag) {
+    const randomScore = Math.floor(Math.random() * 101);
+    const { error } = await supabase.from('questions').insert({
+      student_uuid: user.id,
+      title,
+      body,
+      image_url,
+      status: 'answered',
+      answer_body: `🎉 エイプリルフール特別判定！
+あなたの嘘の点数は... 【 ${randomScore}点 】 です！`
+    });
+
+    if (error) {
+      console.error('Failed to post april fool question', error);
+      throw new Error('質問の送信に失敗しました');
+    }
+
+    await cleanupOldResolvedQuestions(user.id);
+    revalidatePath('/timer');
+    return;
+  }
+
+  const { error } = await supabase.from('questions').insert({
+    student_uuid: user.id,
+    title,
+    body,
+    image_url,
+    status: 'open'
+  });
+
+  if (error) {
+    console.error('Failed to post question', error);
+    throw new Error('質問の送信に失敗しました');
+  }
+
+  await cleanupOldResolvedQuestions(user.id);
+  revalidatePath('/timer');
+  return;
+}
+
+// 生徒が自分の質問スレッドに返信する。返信が来た(=先生の反応待ち)ことが分かるよう、
+// 質問のステータスは常に 'open'(未回答) に戻す。
+export async function replyToQuestion(formData: FormData) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('ログインしていません');
+
+  const questionId = formData.get('question_id') as string;
+  const text = (formData.get('text') as string) || '';
+  const image = formData.get('image') as File | null;
+  const trimmed = text.trim();
+
+  if (!trimmed && !(image && image.size > 0)) throw new Error('返信内容を入力してください');
+
+  const { data: question, error: fetchError } = await supabase
+    .from('questions')
+    .select('replies, student_uuid, status')
+    .eq('id', questionId)
+    .single();
+
+  if (fetchError || !question) throw new Error('質問が見つかりませんでした');
+  if (question.student_uuid !== user.id) throw new Error('この質問に返信する権限がありません');
+  if (question.status === 'resolved') throw new Error('解決済みの質問には返信できません');
+
+  const { data: askerProfile } = await supabase.from('profiles').select('organization_id, rule_overrides').eq('id', user.id).single();
+  let orgRules: OrgRuleMap = {};
+  if (askerProfile?.organization_id) {
+    const { data: org } = await supabase.from('organizations').select('rules').eq('id', askerProfile.organization_id).single();
+    orgRules = (org?.rules as OrgRuleMap) || {};
+  }
+  const effective = resolveEffectiveRules(orgRules, askerProfile?.rule_overrides as RuleMap);
+  if (effective.disable_questions) {
+    throw new Error('教師/管理者によって質問箱の利用が禁止されています。');
+  }
+
+  let image_url: string | null = null;
+  if (image && image.size > 0) {
+    const fileExt = image.name.split('.').pop();
+    const filePath = `replies/${user.id}-${Math.random().toString(36).substring(2)}-${Date.now()}.${fileExt}`;
+
+    const { error: uploadError } = await supabase.storage.from('qa_images').upload(filePath, image);
+    if (uploadError) {
+      console.error('Failed to upload reply image', uploadError);
+      throw new Error(`画像のアップロードに失敗しました: ${uploadError.message}`);
+    }
+
+    image_url = filePath;
+  }
+
+  const updatedReplies = [...(question.replies || []), {
+    role: 'student',
+    text: trimmed,
+    image_url,
+    created_at: new Date().toISOString(),
+  }];
+
+  const { error } = await supabase.from('questions').update({
+    replies: updatedReplies,
+    status: 'open',
+  }).eq('id', questionId);
+
+  if (error) {
+    console.error('Failed to reply to question', error);
+    throw new Error('返信の送信に失敗しました');
+  }
+
+  revalidatePath('/timer');
+}
+
+export async function resolveQuestion(questionId: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('ログインしていません');
+
+  const { error } = await supabase.from('questions').update({ status: 'resolved' }).eq('id', questionId).eq('student_uuid', user.id);
+
+  if (error) {
+    console.error('Failed to resolve question', error);
+    throw new Error('解決済みへの変更に失敗しました');
+  }
+
+  await cleanupOldResolvedQuestions(user.id);
+
+  revalidatePath('/timer');
+}
+
+// お気に入りの切り替え。お気に入りにした質問は自動削除の対象から外れる。
+// 上限(FAVORITE_QUESTION_LIMIT)を超えて新たにお気に入りにすることはできない。
+export async function toggleQuestionFavorite(questionId: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('ログインしていません');
+
+  const { data: question } = await supabase.from('questions').select('student_uuid, is_favorited').eq('id', questionId).single();
+  if (!question || question.student_uuid !== user.id) throw new Error('この質問を操作する権限がありません');
+
+  const nextValue = !question.is_favorited;
+
+  if (nextValue) {
+    const { count } = await supabase
+      .from('questions')
+      .select('id', { count: 'exact', head: true })
+      .eq('student_uuid', user.id)
+      .eq('is_favorited', true);
+
+    if ((count || 0) >= FAVORITE_QUESTION_LIMIT) {
+      throw new Error(`お気に入りは最大${FAVORITE_QUESTION_LIMIT}件までです`);
+    }
+  }
+
+  const { error } = await supabase.from('questions').update({ is_favorited: nextValue }).eq('id', questionId);
+
+  if (error) {
+    console.error('Failed to toggle question favorite', error);
+    throw new Error('お気に入りの更新に失敗しました');
+  }
+
+  revalidatePath('/timer');
+  return nextValue;
+}
+
+type PomodoroEventType = 'START' | 'PAUSE' | 'STOP' | 'COMPLETE' | 'CHECK_REMAINING_TIME' | 'RATING_SUBMITTED' | 'QUIT' | 'ABANDONED';
+type PomodoroMode = 'WORK' | 'BREAK' | 'LONG_BREAK';
+
+export async function logPomodoroEvent(
+  sessionId: string,
+  mode: PomodoroMode,
+  eventType: PomodoroEventType,
+  metadata: Record<string, unknown> = {}
+) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return;
+
+  const { error } = await supabase.from('pomodoro_events').insert({
+    student_uuid: user.id,
+    session_id: sessionId,
+    mode,
+    event_type: eventType,
+    metadata,
+  });
+
+  if (error) console.error('Failed to log pomodoro event', error);
+}
+
+// 「今日の実施回数」バッジは常にDB(pomodoro_events、完了した作業(WORK)の件数)を正とする。
+// startOfDayISOはクライアント側のローカル時刻の0時をISO文字列にしたもの
+// (サーバーのタイムゾーンに依存すると日本時間などとズレるため、必ず
+// クライアントから境界を渡してもらう)。
+// 以前はpomodoro_logsという別テーブルの件数を見ていたが、「タイマーが0になった時点」
+// (pomodoro_events)と「集中度評価を送信した時点」(pomodoro_logs)という異なるタイミングで
+// 別々に記録しており、画面ごとに件数がずれる原因になっていたため、pomodoro_eventsに一本化した。
+export async function getTodayPomoCount(startOfDayISO: string): Promise<number> {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return 0;
+
+  return countCompletedWork(supabase, user.id, startOfDayISO);
+}
+
+export async function logPomodoro(subject: string, minutes: number = 25, concentrationRating?: number, memo?: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) throw new Error('ログインしていません');
+
+  // 完了そのものの記録はpomodoro_events(logPomodoroEvent経由のCOMPLETE)が正なので、
+  // ここでは重複して記録しない。student_activity_logsは実績評価・EXP・科目別集計専用に残す。
+  const metadata: Record<string, string | number> = { minutes, subject };
+  if (concentrationRating) metadata.concentrationRating = concentrationRating;
+  if (memo) metadata.memo = memo;
+
+  // activity_logsの記録と、更新前のtotal_study_minutesの読み取りは互いに独立しているため並列に行う
+  const [{ error: actErr }, { data: profile }] = await Promise.all([
+    supabase.from('student_activity_logs').insert({
+      student_id: user.id,
+      activity_type: 'POMODORO_COMPLETED',
+      metadata
+    }),
+    supabase.from('profiles').select('total_study_minutes').eq('id', user.id).single(),
+  ]);
+  if (actErr) throw new Error('activity logs insert error: ' + actErr.message);
+
+  // profiles の total_study_minutes を更新
+  if (profile) {
+    const { error: profErr } = await supabase.from('profiles').update({
+      total_study_minutes: (profile.total_study_minutes || 0) + minutes
+    }).eq('id', user.id);
+  if (profErr) throw new Error('profile update error: ' + profErr.message);
+  }
+
+  // 実績とレベルアップの自動評価
+  const evaluationResult = await evaluateAchievements(user.id);
+
+  revalidatePath('/');
+  revalidatePath('/timer');
+  revalidatePath('/game');
+
+  return evaluationResult;
+}
+
+// ポモドーロ時間可変化の実験用(CLAUDE.local.md参照)。作業セッション(session_id)に紐づけて、
+// 解いた問題数・正解数・難易度の自己申告・ノート/問題用紙の写真等を記録する軽量なログ。
+// pomodoro_experiment_enabledが有効なアカウントでのみUIから呼ばれる。全項目任意。
+export async function logStudySession(formData: FormData) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('ログインしていません');
+
+  const sessionId = formData.get('session_id') as string | null;
+  if (!sessionId) throw new Error('session_idが指定されていません');
+
+  const parseIntOrNull = (v: FormDataEntryValue | null) => {
+    if (typeof v !== 'string' || v.trim() === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const problem_count = parseIntOrNull(formData.get('problem_count'));
+  const correct_count = parseIntOrNull(formData.get('correct_count'));
+  const difficulty = parseIntOrNull(formData.get('difficulty'));
+  const note = (formData.get('note') as string | null)?.trim() || null;
+  const file = formData.get('file') as File | null;
+
+  let file_path: string | null = null;
+  if (file && file.size > 0) {
+    const fileExt = file.name.split('.').pop();
+    const filePath = `${user.id}/${Date.now()}-${Math.random().toString(36).substring(2)}.${fileExt}`;
+
+    const { error: uploadError } = await supabase.storage.from('study_logs').upload(filePath, file);
+    if (uploadError) {
+      console.error('Failed to upload study log file', uploadError);
+      throw new Error(`ファイルのアップロードに失敗しました: ${uploadError.message}`);
+    }
+
+    // バケットは非公開。パスだけを保存し、閲覧時に署名URLを発行する
+    file_path = filePath;
+  }
+
+  const { error } = await supabase.from('pomodoro_study_logs').insert({
+    student_uuid: user.id,
+    session_id: sessionId,
+    problem_count,
+    correct_count,
+    difficulty,
+    note,
+    file_path,
+  });
+
+  if (error) {
+    console.error('Failed to log study session', error);
+    throw new Error('学習ログの保存に失敗しました: ' + error.message);
+  }
+}
