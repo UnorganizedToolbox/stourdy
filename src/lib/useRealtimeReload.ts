@@ -51,12 +51,24 @@ export function useRealtimeReload(options: {
     };
 
     const supabase = createBrowserClient(url, key);
-    const ch = supabase
-      .channel(channel)
-      .on('postgres_changes', { event: '*', schema: 'public', table, ...(filter ? { filter } : {}) }, () => {
-        void run();
-      })
-      .subscribe();
+    let ch: ReturnType<typeof supabase.channel> | null = null;
+
+    // ログイン情報を読み込む前に購読すると、未ログイン(anon)として登録され、RLS で読める行が無いため
+    // 通知が一切届かない(2026-11-27、生徒側で実際に起きた)。先にセッションを読み、そのトークンを
+    // Realtime に渡してから購読する。
+    void (async () => {
+      const { data } = await supabase.auth.getSession();
+      if (disposed) return;
+      const token = data.session?.access_token;
+      if (token) await supabase.realtime.setAuth(token);
+      if (disposed) return;
+      ch = supabase
+        .channel(channel)
+        .on('postgres_changes', { event: '*', schema: 'public', table, ...(filter ? { filter } : {}) }, () => {
+          void run();
+        })
+        .subscribe();
+    })();
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') void run();
@@ -66,7 +78,7 @@ export function useRealtimeReload(options: {
     return () => {
       disposed = true;
       document.removeEventListener('visibilitychange', onVisible);
-      supabase.removeChannel(ch);
+      if (ch) supabase.removeChannel(ch);
     };
   }, [channel, table, filter]);
 }
