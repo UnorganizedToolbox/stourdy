@@ -62,10 +62,10 @@ export default async function AppLayout({
         <div className="flex items-center gap-3 md:gap-4 min-w-0">
           <MobileMenuButton />
           <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-white font-bold shadow-lg shadow-brand-500/30 shrink-0">
-            L
+            S
           </div>
           <h1 className="text-xl font-black tracking-tight font-title text-slate-800 dark:text-white truncate">
-            Learn<span className="text-brand-600 dark:text-brand-400">Flow</span>
+            stourdy
             {isAdmin && <span className="ml-2 text-xs bg-rose-100 text-rose-700 px-2 py-0.5 rounded-full font-bold">Admin</span>}
           </h1>
         </div>
