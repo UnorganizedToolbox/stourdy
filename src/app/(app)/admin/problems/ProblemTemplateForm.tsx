@@ -312,7 +312,7 @@ export default function ProblemTemplateForm({
 
             <div className="card-glass bg-white dark:bg-darkbg-secondary border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
               <h3 className="font-bold text-slate-800 dark:text-white mb-1">② 制約条件</h3>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">四則演算を含む比較式。例: <code>A != B</code>、<code>A/B != 1/2</code>、<code>forall(A) A*A != B</code></p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">四則演算と剰余(<code>%</code>)を含む比較式。例: <code>A != B</code>、<code>A/B != 1/2</code>、<code>A % 3 == 0</code>、<code>forall(A) A*A != B</code></p>
 
               <div className="space-y-2">
                 {constraints.map((c, idx) => (

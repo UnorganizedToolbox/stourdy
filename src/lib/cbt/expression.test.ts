@@ -28,6 +28,20 @@ describe('expression parser/evaluator', () => {
     expect(() => evaluate(parseExpr('1/0'), {})).toThrow(/ゼロ除算/);
   });
 
+  it('evaluates % as mathematical modulo with * / precedence', () => {
+    expect(evaluate(parseExpr('7 % 3'), {})).toBe(1);
+    expect(evaluate(parseExpr('-7 % 3'), {})).toBe(2);
+    expect(evaluate(parseExpr('7 % -3'), {})).toBe(-2);
+    expect(evaluate(parseExpr('1 + 7 % 3'), {})).toBe(2);
+    expect(evaluate(parseExpr('2 * 7 % 4'), {})).toBe(2);
+    expect(evaluate(parseExpr('A % B'), { A: 12, B: 4 })).toBe(0);
+  });
+
+  it('throws for % with zero or non-integer operands', () => {
+    expect(() => evaluate(parseExpr('5 % 0'), {})).toThrow(/ゼロ除算/);
+    expect(() => evaluate(parseExpr('5.5 % 2'), {})).toThrow(/整数/);
+  });
+
   it('throws for malformed expressions', () => {
     expect(() => parseExpr('1 +')).toThrow();
     expect(() => parseExpr('(1 + 2')).toThrow();

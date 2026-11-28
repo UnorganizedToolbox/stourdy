@@ -14,6 +14,16 @@ describe('constraints', () => {
     expect(evaluateConstraint(c, { A: 1, B: 2 }, {})).toBe(false);
   });
 
+  it('supports % in constraints', () => {
+    const c = parseConstraint('A % 3 == 0');
+    expect(evaluateConstraint(c, { A: 9 }, {})).toBe(true);
+    expect(evaluateConstraint(c, { A: 10 }, {})).toBe(false);
+    const f = parseConstraint('forall(K) B % K != 0');
+    const bounds = { K: { type: 'integer' as const, min: 2, max: 4 } };
+    expect(evaluateConstraint(f, { B: 7 }, bounds)).toBe(true);
+    expect(evaluateConstraint(f, { B: 9 }, bounds)).toBe(false);
+  });
+
   it('collects dependencies including the forall-bound variable', () => {
     const c = parseConstraint('forall(A) A*A != B');
     expect([...constraintDependencies(c)].sort()).toEqual(['A', 'B']);

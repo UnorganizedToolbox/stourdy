@@ -1,4 +1,4 @@
-// 四則演算(+ - * /)・括弧・変数参照のみをサポートする式パーサー/評価器。
+// 四則演算(+ - * /)・剰余(%)・括弧・変数参照のみをサポートする式パーサー/評価器。
 // 範囲式(min/max)・制約・問題文中の {{式}} すべてで共通して使う。
 // sqrt 等の関数は対象外(問題文中では Typst 構文としてそのまま書けるため不要)。
 
@@ -6,12 +6,12 @@ export type Expr =
   | { kind: 'num'; value: number }
   | { kind: 'var'; name: string }
   | { kind: 'neg'; expr: Expr }
-  | { kind: 'bin'; op: '+' | '-' | '*' | '/'; left: Expr; right: Expr };
+  | { kind: 'bin'; op: '+' | '-' | '*' | '/' | '%'; left: Expr; right: Expr };
 
 type Token =
   | { type: 'num'; value: number }
   | { type: 'ident'; value: string }
-  | { type: 'punct'; value: '+' | '-' | '*' | '/' | '(' | ')' };
+  | { type: 'punct'; value: '+' | '-' | '*' | '/' | '%' | '(' | ')' };
 
 function tokenize(src: string): Token[] {
   const tokens: Token[] = [];
@@ -39,8 +39,8 @@ function tokenize(src: string): Token[] {
       i = j;
       continue;
     }
-    if ('+-*/()'.includes(c)) {
-      tokens.push({ type: 'punct', value: c as '+' | '-' | '*' | '/' | '(' | ')' });
+    if ('+-*/%()'.includes(c)) {
+      tokens.push({ type: 'punct', value: c as '+' | '-' | '*' | '/' | '%' | '(' | ')' });
       i++;
       continue;
     }
@@ -87,6 +87,8 @@ class Parser {
         left = { kind: 'bin', op: '*', left, right: this.parseUnary() };
       } else if (this.consumePunct('/')) {
         left = { kind: 'bin', op: '/', left, right: this.parseUnary() };
+      } else if (this.consumePunct('%')) {
+        left = { kind: 'bin', op: '%', left, right: this.parseUnary() };
       } else {
         break;
       }
@@ -161,6 +163,12 @@ export function evaluate(expr: Expr, scope: Record<string, number>): number {
         case '/':
           if (r === 0) throw new Error('ゼロ除算です');
           return l / r;
+        case '%':
+          // 数学の mod(結果は割る数と同じ符号。-7 % 3 = 2)。JavaScript の % は -7 % 3 = -1 になり、
+          // 「A を 3 で割った余り」の意図とずれるため使わない。整数どうしに限る。
+          if (!Number.isInteger(l) || !Number.isInteger(r)) throw new Error('剰余(%)は整数どうしにのみ使えます');
+          if (r === 0) throw new Error('ゼロ除算です');
+          return l - r * Math.floor(l / r);
       }
     }
   }
