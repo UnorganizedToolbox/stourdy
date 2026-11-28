@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatJstDate, formatJstTime, formatJstDateTime } from './formatDate';
+import { formatJstDate, formatJstTime, formatJstDateTime, startOfJstDayISO } from './formatDate';
 
 // 2026-10-11、/timerと/adminで再現したReactハイドレーションエラー(#418)への対応。
 // サーバー側のデフォルトロケール(実行環境依存)とブラウザのデフォルトロケールの不一致を
@@ -31,5 +31,17 @@ describe('formatJstDateTime', () => {
     const result = formatJstDateTime('2026-10-11T03:00:00Z');
     expect(result).toContain('2026/10/11');
     expect(result).toContain('12:00:00');
+  });
+});
+
+describe('startOfJstDayISO', () => {
+  it('日本時間の朝9時前(UTCでは前日)でも、日本時間の当日0時を返す', () => {
+    expect(startOfJstDayISO(new Date('2026-11-28T08:59:00+09:00'))).toBe('2026-11-27T15:00:00.000Z');
+  });
+  it('日本時間の9時以降も同じ日の0時を返す', () => {
+    expect(startOfJstDayISO(new Date('2026-11-28T23:59:59+09:00'))).toBe('2026-11-27T15:00:00.000Z');
+  });
+  it('日本時間の0時ちょうどはその日の0時', () => {
+    expect(startOfJstDayISO(new Date('2026-11-28T00:00:00+09:00'))).toBe('2026-11-27T15:00:00.000Z');
   });
 });

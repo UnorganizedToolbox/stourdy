@@ -577,6 +577,23 @@ export default function PomodoroTimer({ gradeLevel, experimentEnabled = false }:
     setSessionId(null);
   };
 
+  // 休憩の「スキップ」: 休憩を途中でやめ、休憩が終わったときと同じ「学習を再開する/終了する」の
+  // 決定待ち画面へ進む(2026-11-28 ユーザー指示)。休憩に「中止」を置くと、その休憩の満タンの時間
+  // (5分など)に戻るだけで意味が分からないため、休憩中は中止の代わりにこれを置く。
+  // 休憩は完了していないので COMPLETE は記録せず、STOP に skipped を付けて区別できるようにする。
+  const handleSkipBreak = () => {
+    stopSessionAudio();
+    workerRef.current?.postMessage('stop');
+    if (sessionId) void logPomodoroEvent(sessionId, mode, 'STOP', { skipped: true });
+    setIsRunning(false);
+    setTargetEndTime(null);
+    setMode('WORK');
+    setTimeLeft(resolveDuration('WORK'));
+    setAwaitingDecision(true);
+    // 決定待ち画面に入るので、休憩完了時と同じく次のWORKを基準にCookieを延長する
+    touchActivity(WORK_TIME);
+  };
+
   // 決定待ち画面・一時停止画面を、手動("終了する"ボタン)または自動(放置検出)で終える共通処理。
   const endCurrentSession = useCallback((auto: boolean) => {
     if (sessionId) {
@@ -771,10 +788,12 @@ export default function PomodoroTimer({ gradeLevel, experimentEnabled = false }:
 
             {(isRunning || sessionId) && (
               <button
-                onClick={handleStop}
+                onClick={isWork ? handleStop : handleSkipBreak}
                 className="flex-none px-6 py-4 bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-2xl font-bold shadow-md transition-all active:scale-95"
               >
-                <i className="fa-solid fa-stop mr-2"></i> 中止
+                {isWork
+                  ? <><i className="fa-solid fa-stop mr-2"></i> 中止</>
+                  : <><i className="fa-solid fa-forward mr-2"></i> スキップ</>}
               </button>
             )}
           </div>

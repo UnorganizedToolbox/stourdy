@@ -24,3 +24,14 @@ export function formatJstTime(input: string | number | Date): string {
 export function formatJstDateTime(input: string | number | Date): string {
   return new Date(input).toLocaleString(LOCALE, { timeZone: JST_TIME_ZONE });
 }
+
+// 日本時間の「今日」の0時を ISO 文字列で返す。サーバー(Vercel は UTC)で `setHours(0,0,0,0)` を
+// 使うと UTC の0時(日本時間の9時)になり、朝9時より前の記録が「今日」から漏れる(2026-11-28、
+// 団体の学習状況の「今日N回」が生徒側とずれていた)。日本時間に夏時間はないので固定の +9 時間で計算する。
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export function startOfJstDayISO(now: Date = new Date()): string {
+  const jstMs = now.getTime() + JST_OFFSET_MS;
+  return new Date(Math.floor(jstMs / DAY_MS) * DAY_MS - JST_OFFSET_MS).toISOString();
+}

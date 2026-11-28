@@ -5,6 +5,7 @@ import Link from "next/link";
 import { ArrowLeft, Flame, Coffee, Moon } from "lucide-react";
 import { countCompletedWorkByStudent } from "@/lib/pomodoroAnalyticsLoader";
 import RealtimePageRefresh from "../components/RealtimePageRefresh";
+import { startOfJstDayISO } from "@/lib/formatDate";
 
 const RUNNING_EVENTS = new Set(['START', 'CHECK_REMAINING_TIME']);
 
@@ -40,8 +41,6 @@ export default async function TeacherPomodoroPage() {
   const studentIds = (students || []).map(s => s.id);
   const safeIds = studentIds.length > 0 ? studentIds : ['00000000-0000-0000-0000-000000000000'];
 
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
 
   // recentEvents・todayCountsはどちらもsafeIdsだけに依存し互いに独立しているため並列に取得する
   const [{ data: recentEvents }, todayCounts] = await Promise.all([
@@ -51,7 +50,7 @@ export default async function TeacherPomodoroPage() {
       .in('student_uuid', safeIds)
       .order('created_at', { ascending: false })
       .limit(500),
-    countCompletedWorkByStudent(supabase, safeIds, startOfDay.toISOString()),
+    countCompletedWorkByStudent(supabase, safeIds, startOfJstDayISO()),
   ]);
 
   type EventRow = { student_uuid: string; event_type: string; mode: string; metadata: { subject?: string } | null; created_at: string };
