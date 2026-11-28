@@ -1,4 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { startOfJstDayISO } from './formatDate';
 
 export interface GoogleCalendarEvent {
   id?: string;
@@ -92,10 +93,10 @@ export async function getGoogleCalendarEvents(
   supabase: SupabaseClient,
   userId: string
 ): Promise<{ linked: boolean; events: GoogleCalendarEvent[] }> {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const endOfDay = new Date();
-  endOfDay.setHours(23, 59, 59, 999);
+  // サーバー(Vercel は UTC)で setHours を使うと UTC の1日になり、日本時間の0〜9時は前日の予定を
+  // 「今日」として返してしまう。日本時間の0時から24時間(終わりは翌0時の1ミリ秒前)を今日とする。
+  const startOfDay = startOfJstDayISO();
+  const endOfDay = new Date(new Date(startOfDay).getTime() + 24 * 60 * 60 * 1000 - 1).toISOString();
 
-  return getGoogleCalendarEventsInRange(supabase, userId, startOfDay.toISOString(), endOfDay.toISOString());
+  return getGoogleCalendarEventsInRange(supabase, userId, startOfDay, endOfDay);
 }
